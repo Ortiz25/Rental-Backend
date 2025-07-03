@@ -1,0 +1,1651 @@
+import express from 'express';
+import pool from '../config/database.js';
+import { authenticateToken, authorizeRole, authenticateTokenSimple} from '../middleware/auth.js';
+
+const router = express.Router();
+
+// Get all tenants with lease and property information
+router.get('/', authenticateTokenSimple, async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    console.log('Fetching tenants for user:', req.user.id);
+
+    // Main query to get tenants with lease and property details
+    const tenantsQuery = `
+      SELECT 
+        t.id,
+        t.first_name,
+        t.last_name,
+        t.email,
+        t.phone,
+        t.alternate_phone,
+        t.date_of_birth,
+        t.identification_type,
+        t.identification_number,
+        t.emergency_contact_name,
+        t.emergency_contact_phone,
+        t.emergency_contact_relationship,
+        t.employment_status,
+        t.employer_name,
+        t.monthly_income,
+        t.created_at,
+        
+        -- Current lease information
+        l.id as lease_id,
+        l.lease_number,
+        l.lease_status,
+        l.start_date,
+        l.end_date,
+        l.monthly_rent,
+        l.security_deposit,
+        l.move_in_date,
+        l.move_out_date,
+        
+        -- Property and unit information
+        p.property_name,
+        p.address as property_address,
+        u.unit_number,
+        
+        -- Lease tenant relationship
+        lt.is_primary_tenant,
+        lt.tenant_type,
+        
+        -- Payment status information
+        (
+          SELECT rp.payment_status 
+          FROM rent_payments rp 
+          WHERE rp.lease_id = l.id 
+          ORDER BY rp.due_date DESC 
+          LIMIT 1
+        ) as last_payment_status,
+        (
+          SELECT rp.payment_date 
+          FROM rent_payments rp 
+          WHERE rp.lease_id = l.id 
+          AND rp.payment_status = 'paid'
+          ORDER BY rp.payment_date DESC 
+          LIMIT 1
+        ) as last_payment_date,
+        
+        -- Count overdue payments
+        (
+          SELECT COUNT(*) 
+          FROM rent_payments rp 
+          WHERE rp.lease_id = l.id 
+          AND rp.payment_status = 'overdue'
+        ) as overdue_payments_count
+        
+      FROM tenants t
+      LEFT JOIN lease_tenants lt ON t.id = lt.tenant_id AND lt.removed_date IS NULL
+      LEFT JOIN leases l ON lt.lease_id = l.id AND l.lease_status = 'active'
+      LEFT JOIN units u ON l.unit_id = u.id
+      LEFT JOIN properties p ON u.property_id = p.id
+      ORDER BY t.created_at DESC
+    `;
+
+    const tenantsResult = await client.query(tenantsQuery);
+
+    // Get payment history for each tenant
+    const paymentHistoryQuery = `
+      SELECT 
+        rp.id,
+        rp.lease_id,
+        rp.payment_date,
+        rp.due_date,
+        rp.amount_due,
+        rp.amount_paid,
+        rp.payment_method,
+        rp.payment_status,
+        rp.late_fee,
+        l.lease_number,
+        lt.tenant_id
+      FROM rent_payments rp
+      JOIN leases l ON rp.lease_id = l.id
+      JOIN lease_tenants lt ON l.id = lt.lease_id
+      WHERE lt.removed_date IS NULL
+      ORDER BY rp.due_date DESC
+    `;
+
+    const paymentsResult = await client.query(paymentHistoryQuery);
+
+    // Get documents for each tenant
+    const documentsQuery = `
+      SELECT 
+        td.id,
+        td.tenant_id,
+        td.document_type,
+        td.document_name,
+        td.file_path,
+        td.upload_date,
+        td.uploaded_by
+      FROM tenant_documents td
+      ORDER BY td.upload_date DESC
+    `;
+
+    const documentsResult = await client.query(documentsQuery);
+
+    // Format the response data
+    const paymentsByTenant = {};
+    paymentsResult.rows.forEach(payment => {
+      if (!paymentsByTenant[payment.tenant_id]) {
+        paymentsByTenant[payment.tenant_id] = [];
+      }
+      paymentsByTenant[payment.tenant_id].push({
+        id: payment.id,
+        date: payment.payment_date,
+        dueDate: payment.due_date,
+        amount: parseFloat(payment.amount_paid),
+        amountDue: parseFloat(payment.amount_due),
+        type: 'Rent',
+        status: payment.payment_status === 'paid' ? 'Paid' : 
+               payment.payment_status === 'overdue' ? 'Late' : 'Pending',
+        method: payment.payment_method,
+        lateFee: parseFloat(payment.late_fee) || 0
+      });
+    });
+
+    const documentsByTenant = {};
+    documentsResult.rows.forEach(doc => {
+      if (!documentsByTenant[doc.tenant_id]) {
+        documentsByTenant[doc.tenant_id] = [];
+      }
+      documentsByTenant[doc.tenant_id].push({
+        name: doc.document_name,
+        type: doc.document_type.toLowerCase().replace(' ', '_'),
+        date: doc.upload_date,
+        uploadedBy: doc.uploaded_by
+      });
+    });
+
+    const formattedTenants = tenantsResult.rows.map(tenant => {
+      // Determine tenant status
+      let status = 'Active';
+      const today = new Date();
+      const leaseEnd = tenant.end_date ? new Date(tenant.end_date) : null;
+      
+      if (tenant.overdue_payments_count > 0) {
+        status = 'Warning';
+      } else if (leaseEnd && leaseEnd <= today) {
+        status = 'Expired';
+      } else if (!tenant.lease_id) {
+        status = 'No Active Lease';
+      }
+
+      return {
+        id: tenant.id,
+        name: `${tenant.first_name} ${tenant.last_name}`,
+        email: tenant.email,
+        phone: tenant.phone,
+        alternatePhone: tenant.alternate_phone,
+        dateOfBirth: tenant.date_of_birth,
+        identificationType: tenant.identification_type,
+        identificationNumber: tenant.identification_number,
+        
+        // Emergency contact
+        emergencyContact: {
+          name: tenant.emergency_contact_name,
+          phone: tenant.emergency_contact_phone,
+          relationship: tenant.emergency_contact_relationship
+        },
+        
+        // Employment info
+        employmentStatus: tenant.employment_status,
+        employerName: tenant.employer_name,
+        monthlyIncome: parseFloat(tenant.monthly_income) || 0,
+        
+        // Property and lease info
+        propertyId: tenant.lease_id ? 1 : null, // Simplified for now
+        propertyName: tenant.property_name 
+          ? `${tenant.property_name}, ${tenant.unit_number ? `Unit ${tenant.unit_number}` : ''}`
+          : 'No Active Lease',
+        leaseStart: tenant.start_date,
+        leaseEnd: tenant.end_date,
+        rentAmount: parseFloat(tenant.monthly_rent) || 0,
+        securityDeposit: parseFloat(tenant.security_deposit) || 0,
+        
+        // Payment info
+        paymentStatus: tenant.last_payment_status === 'paid' ? 'Paid' : 
+                      tenant.last_payment_status === 'overdue' ? 'Late' : 'Pending',
+        lastPaymentDate: tenant.last_payment_date,
+        
+        // Status and metadata
+        status: status,
+        isPrimaryTenant: tenant.is_primary_tenant || false,
+        tenantType: tenant.tenant_type || 'Tenant',
+        createdAt: tenant.created_at,
+        
+        // Related data
+        paymentHistory: paymentsByTenant[tenant.id] || [],
+        documents: documentsByTenant[tenant.id] || []
+      };
+    });
+
+    // Calculate summary statistics
+    const tenantStats = {
+      totalTenants: formattedTenants.length,
+      activeLeases: formattedTenants.filter(t => t.status === 'Active').length,
+      pendingPayments: formattedTenants.filter(t => t.paymentStatus === 'Late').length,
+      expiringLeases: formattedTenants.filter(t => {
+        if (!t.leaseEnd) return false;
+        const leaseEnd = new Date(t.leaseEnd);
+        const thirtyDaysFromNow = new Date();
+        thirtyDaysFromNow.setDate(thirtyDaysFromNow.getDate() + 30);
+        return leaseEnd <= thirtyDaysFromNow && leaseEnd > new Date();
+      }).length
+    };
+
+    // Log activity
+    await client.query(
+      `INSERT INTO user_activity_log 
+       (user_id, activity_type, activity_description, ip_address, user_agent)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        req.user.id,
+        'tenants_viewed',
+        'Viewed tenants list',
+        req.ip,
+        req.headers['user-agent']
+      ]
+    );
+
+    res.status(200).json({
+      status: 200,
+      message: 'Tenants retrieved successfully',
+      data: {
+        tenants: formattedTenants,
+        stats: tenantStats,
+        totalCount: formattedTenants.length
+      }
+    });
+
+  } catch (error) {
+    console.error('Tenants fetch error:', error);
+    
+    res.status(500).json({
+      status: 500,
+      message: 'Failed to fetch tenants',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// Get single tenant by ID with detailed information
+router.get('/:id', authenticateTokenSimple, async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+      const tenantId = req.params.id;
+  
+      const tenantQuery = `
+        SELECT 
+          t.*,
+          l.id as lease_id,
+          l.lease_number,
+          l.lease_status,
+          l.start_date,
+          l.end_date,
+          l.monthly_rent,
+          l.security_deposit,
+          p.property_name,
+          u.unit_number,
+          lt.is_primary_tenant,
+          lt.tenant_type
+        FROM tenants t
+        LEFT JOIN lease_tenants lt ON t.id = lt.tenant_id AND lt.removed_date IS NULL
+        LEFT JOIN leases l ON lt.lease_id = l.id AND l.lease_status = 'active'
+        LEFT JOIN units u ON l.unit_id = u.id
+        LEFT JOIN properties p ON u.property_id = p.id
+        WHERE t.id = $1
+      `;
+  
+      const tenantResult = await client.query(tenantQuery, [tenantId]);
+  
+      if (tenantResult.rows.length === 0) {
+        return res.status(404).json({
+          status: 404,
+          message: 'Tenant not found'
+        });
+      }
+  
+      res.status(200).json({
+        status: 200,
+        message: 'Tenant retrieved successfully',
+        data: tenantResult.rows[0]
+      });
+  
+    } catch (error) {
+      console.error('Tenant fetch error:', error);
+      
+      res.status(500).json({
+        status: 500,
+        message: 'Failed to fetch tenant',
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      });
+    } finally {
+      client.release();
+    }
+  });
+  
+  // Create new tenant (onboarding)
+  router.post('/', authenticateTokenSimple, async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+      await client.query('BEGIN');
+  
+      const {
+        firstName,
+        lastName,
+        email,
+        phone,
+        alternatePhone,
+        dateOfBirth,
+        identificationType,
+        identificationNumber,
+        emergencyContactName,
+        emergencyContactPhone,
+        emergencyContactRelationship,
+        employmentStatus,
+        employerName,
+        monthlyIncome,
+        previousAddress,
+        // Lease information
+        propertyId,
+        unitId,
+        leaseStart,
+        leaseEnd,
+        monthlyRent,
+        securityDeposit,
+        leaseTerms,
+        moveInDate
+      } = req.body;
+  
+      // Validate required fields
+      if (!firstName || !lastName || !email) {
+        return res.status(400).json({
+          status: 400,
+          message: 'First name, last name, and email are required'
+        });
+      }
+  
+      // Check if email already exists
+      const emailCheck = await client.query(
+        'SELECT id FROM tenants WHERE email = $1',
+        [email]
+      );
+  
+      if (emailCheck.rows.length > 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          status: 400,
+          message: 'Email already exists'
+        });
+      }
+  
+      // Insert tenant
+      const tenantQuery = `
+        INSERT INTO tenants (
+          first_name, last_name, email, phone, alternate_phone,
+          date_of_birth, identification_type, identification_number,
+          emergency_contact_name, emergency_contact_phone, emergency_contact_relationship,
+          employment_status, employer_name, monthly_income, previous_address
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        RETURNING *
+      `;
+  
+      const tenantResult = await client.query(tenantQuery, [
+        firstName, lastName, email, phone, alternatePhone,
+        dateOfBirth, identificationType, identificationNumber,
+        emergencyContactName, emergencyContactPhone, emergencyContactRelationship,
+        employmentStatus, employerName, monthlyIncome, previousAddress
+      ]);
+  
+      const newTenant = tenantResult.rows[0];
+  
+      // Create lease if lease information is provided
+      if (unitId && leaseStart && monthlyRent) {
+        // Check if unit is available
+        const unitCheck = await client.query(
+          'SELECT occupancy_status FROM units WHERE id = $1',
+          [unitId]
+        );
+  
+        if (unitCheck.rows.length === 0) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({
+            status: 400,
+            message: 'Unit not found'
+          });
+        }
+  
+        if (unitCheck.rows[0].occupancy_status === 'occupied') {
+          await client.query('ROLLBACK');
+          return res.status(400).json({
+            status: 400,
+            message: 'Unit is already occupied'
+          });
+        }
+  
+        // Create lease
+        const leaseQuery = `
+          INSERT INTO leases (
+            unit_id, lease_status, start_date, end_date, monthly_rent,
+            security_deposit, lease_terms, move_in_date
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+          RETURNING *
+        `;
+  
+        const leaseResult = await client.query(leaseQuery, [
+          unitId, 'active', leaseStart, leaseEnd, monthlyRent,
+          securityDeposit, leaseTerms, moveInDate
+        ]);
+  
+        const newLease = leaseResult.rows[0];
+  
+        // Link tenant to lease
+        await client.query(
+          'INSERT INTO lease_tenants (lease_id, tenant_id, is_primary_tenant) VALUES ($1, $2, $3)',
+          [newLease.id, newTenant.id, true]
+        );
+  
+        // Update unit status
+        await client.query(
+          'UPDATE units SET occupancy_status = $1 WHERE id = $2',
+          ['occupied', unitId]
+        );
+      }
+  
+      // Log activity
+      await client.query(
+        `INSERT INTO user_activity_log 
+         (user_id, activity_type, activity_description, affected_resource_type, affected_resource_id, ip_address, user_agent)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          req.user.id,
+          'tenant_created',
+          `Created new tenant: ${firstName} ${lastName}`,
+          'tenant',
+          newTenant.id,
+          req.ip,
+          req.headers['user-agent']
+        ]
+      );
+  
+      await client.query('COMMIT');
+  
+      res.status(201).json({
+        status: 201,
+        message: 'Tenant created successfully',
+        data: newTenant
+      });
+  
+    } catch (error) {
+      await client.query('ROLLBACK');
+      console.error('Tenant creation error:', error);
+      
+      res.status(500).json({
+        status: 500,
+        message: 'Failed to create tenant',
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      });
+    } finally {
+      client.release();
+    }
+  });
+  
+  // Update tenant information
+  router.put('/:id', authenticateTokenSimple, async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+      const tenantId = req.params.id;
+      const {
+        firstName,
+        lastName,
+        email,
+        phone,
+        alternatePhone,
+        dateOfBirth,
+        identificationType,
+        identificationNumber,
+        emergencyContactName,
+        emergencyContactPhone,
+        emergencyContactRelationship,
+        employmentStatus,
+        employerName,
+        monthlyIncome,
+        previousAddress
+      } = req.body;
+  
+      // Check if tenant exists
+      const tenantCheck = await client.query(
+        'SELECT id FROM tenants WHERE id = $1',
+        [tenantId]
+      );
+  
+      if (tenantCheck.rows.length === 0) {
+        return res.status(404).json({
+          status: 404,
+          message: 'Tenant not found'
+        });
+      }
+  
+      // Update tenant
+      const updateQuery = `
+        UPDATE tenants SET 
+          first_name = $1,
+          last_name = $2,
+          email = $3,
+          phone = $4,
+          alternate_phone = $5,
+          date_of_birth = $6,
+          identification_type = $7,
+          identification_number = $8,
+          emergency_contact_name = $9,
+          emergency_contact_phone = $10,
+          emergency_contact_relationship = $11,
+          employment_status = $12,
+          employer_name = $13,
+          monthly_income = $14,
+          previous_address = $15,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = $16
+        RETURNING *
+      `;
+  
+      const result = await client.query(updateQuery, [
+        firstName, lastName, email, phone, alternatePhone,
+        dateOfBirth, identificationType, identificationNumber,
+        emergencyContactName, emergencyContactPhone, emergencyContactRelationship,
+        employmentStatus, employerName, monthlyIncome, previousAddress,
+        tenantId
+      ]);
+  
+      // Log activity
+      await client.query(
+        `INSERT INTO user_activity_log 
+         (user_id, activity_type, activity_description, affected_resource_type, affected_resource_id, ip_address, user_agent)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          req.user.id,
+          'tenant_updated',
+          `Updated tenant: ${firstName} ${lastName}`,
+          'tenant',
+          tenantId,
+          req.ip,
+          req.headers['user-agent']
+        ]
+      );
+  
+      res.status(200).json({
+        status: 200,
+        message: 'Tenant updated successfully',
+        data: result.rows[0]
+      });
+  
+    } catch (error) {
+      console.error('Tenant update error:', error);
+      
+      res.status(500).json({
+        status: 500,
+        message: 'Failed to update tenant',
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      });
+    } finally {
+      client.release();
+    }
+  });
+  
+// Offboard tenant (terminate lease)
+router.post('/:id/offboard', authenticateTokenSimple,async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+      await client.query('BEGIN');
+      
+      const tenantId = req.params.id;
+      const {
+        moveOutDate,
+        depositRefund,
+        deductions = [],
+        notes,
+        confirmAddress,
+        keyReturn,
+        inspectionFindings
+      } = req.body;
+  
+      // Get tenant and current lease information
+      const tenantQuery = `
+        SELECT 
+          t.first_name,
+          t.last_name,
+          t.email,
+          l.id as lease_id,
+          l.lease_number,
+          l.security_deposit,
+          u.id as unit_id,
+          u.unit_number,
+          p.property_name
+        FROM tenants t
+        JOIN lease_tenants lt ON t.id = lt.tenant_id AND lt.removed_date IS NULL
+        JOIN leases l ON lt.lease_id = l.id AND l.lease_status = 'active'
+        JOIN units u ON l.unit_id = u.id
+        JOIN properties p ON u.property_id = p.id
+        WHERE t.id = $1
+      `;
+  
+      const tenantResult = await client.query(tenantQuery, [tenantId]);
+  
+      if (tenantResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({
+          status: 404,
+          message: 'Tenant not found or no active lease'
+        });
+      }
+  
+      const tenant = tenantResult.rows[0];
+  
+      // Update lease status and move-out date
+      await client.query(
+        `UPDATE leases SET 
+         lease_status = 'terminated',
+         move_out_date = $1,
+         updated_at = CURRENT_TIMESTAMP
+         WHERE id = $2`,
+        [moveOutDate, tenant.lease_id]
+      );
+  
+      // Update lease_tenants with removal date
+      await client.query(
+        'UPDATE lease_tenants SET removed_date = $1 WHERE lease_id = $2 AND tenant_id = $3',
+        [moveOutDate, tenant.lease_id, tenantId]
+      );
+  
+      // Update unit status to vacant
+      await client.query(
+        'UPDATE units SET occupancy_status = $1 WHERE id = $2',
+        ['vacant', tenant.unit_id]
+      );
+  
+      // Calculate total deductions
+      const totalDeductions = deductions.reduce((sum, deduction) => 
+        sum + (parseFloat(deduction.amount) || 0), 0
+      );
+  
+      // Process security deposit return
+      const actualRefund = Math.max(0, tenant.security_deposit - totalDeductions);
+      
+      await client.query(
+        `INSERT INTO security_deposits (
+          lease_id, deposit_type, amount_collected, collection_date,
+          amount_returned, return_date, deductions, deduction_reason, status
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          tenant.lease_id,
+          'Security',
+          tenant.security_deposit,
+          new Date(), // Assuming collected at lease start
+          actualRefund,
+          moveOutDate,
+          totalDeductions,
+          deductions.map(d => `${d.description}: $${d.amount}`).join('; '),
+          actualRefund === tenant.security_deposit ? 'fully_returned' : 
+          actualRefund > 0 ? 'partially_returned' : 'forfeited'
+        ]
+      );
+  
+      // Create offboarding document record
+      const offboardingData = {
+        moveOutDate,
+        depositRefund: actualRefund,
+        deductions,
+        totalDeductions,
+        notes,
+        confirmAddress,
+        keyReturn,
+        inspectionFindings,
+        processedBy: req.user.username,
+        processedAt: new Date()
+      };
+  
+      await client.query(
+        `INSERT INTO tenant_documents (
+          tenant_id, document_type, document_name, upload_date, uploaded_by
+        ) VALUES ($1, $2, $3, $4, $5)`,
+        [
+          tenantId,
+          'Other',
+          `Offboarding Record - ${tenant.lease_number}`,
+          new Date(),
+          req.user.username
+        ]
+      );
+  
+      // Log activity
+      await client.query(
+        `INSERT INTO user_activity_log 
+         (user_id, activity_type, activity_description, affected_resource_type, affected_resource_id, ip_address, user_agent, additional_data)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          req.user.id,
+          'tenant_offboarded',
+          `Offboarded tenant: ${tenant.first_name} ${tenant.last_name} from ${tenant.property_name} Unit ${tenant.unit_number}`,
+          'tenant',
+          tenantId,
+          req.ip,
+          req.headers['user-agent'],
+          JSON.stringify(offboardingData)
+        ]
+      );
+  
+      await client.query('COMMIT');
+  
+      res.status(200).json({
+        status: 200,
+        message: 'Tenant offboarded successfully',
+        data: {
+          tenantId,
+          leaseId: tenant.lease_id,
+          moveOutDate,
+          securityDepositRefund: actualRefund,
+          totalDeductions,
+          processedAt: new Date()
+        }
+      });
+  
+    } catch (error) {
+      await client.query('ROLLBACK');
+      console.error('Tenant offboarding error:', error);
+      
+      res.status(500).json({
+        status: 500,
+        message: 'Failed to offboard tenant',
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      });
+    } finally {
+      client.release();
+    }
+  });
+  
+  // Get tenant payment history
+  router.get('/:id/payments', authenticateTokenSimple,  async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+      const tenantId = req.params.id;
+  
+      const paymentsQuery = `
+        SELECT 
+          rp.id,
+          rp.payment_date,
+          rp.due_date,
+          rp.amount_due,
+          rp.amount_paid,
+          rp.payment_method,
+          rp.payment_status,
+          rp.late_fee,
+          rp.payment_reference,
+          rp.notes,
+          l.lease_number,
+          l.monthly_rent
+        FROM rent_payments rp
+        JOIN leases l ON rp.lease_id = l.id
+        JOIN lease_tenants lt ON l.id = lt.lease_id
+        WHERE lt.tenant_id = $1
+        ORDER BY rp.due_date DESC
+      `;
+  
+      const result = await client.query(paymentsQuery, [tenantId]);
+  
+      res.status(200).json({
+        status: 200,
+        message: 'Payment history retrieved successfully',
+        data: result.rows
+      });
+  
+    } catch (error) {
+      console.error('Payment history fetch error:', error);
+      
+      res.status(500).json({
+        status: 500,
+        message: 'Failed to fetch payment history',
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      });
+    } finally {
+      client.release();
+    }
+  });
+  
+  // Get tenant documents
+  router.get('/:id/documents', authenticateTokenSimple, async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+      const tenantId = req.params.id;
+  
+      const documentsQuery = `
+        SELECT 
+          id,
+          document_type,
+          document_name,
+          file_path,
+          file_size,
+          mime_type,
+          upload_date,
+          uploaded_by
+        FROM tenant_documents
+        WHERE tenant_id = $1
+        ORDER BY upload_date DESC
+      `;
+  
+      const result = await client.query(documentsQuery, [tenantId]);
+  
+      res.status(200).json({
+        status: 200,
+        message: 'Tenant documents retrieved successfully',
+        data: result.rows
+      });
+  
+    } catch (error) {
+      console.error('Documents fetch error:', error);
+      
+      res.status(500).json({
+        status: 500,
+        message: 'Failed to fetch tenant documents',
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      });
+    } finally {
+      client.release();
+    }
+  });
+  
+  // Upload tenant document
+  router.post('/:id/documents', authenticateTokenSimple, async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+      const tenantId = req.params.id;
+      const {
+        documentType,
+        documentName,
+        filePath,
+        fileSize,
+        mimeType
+      } = req.body;
+  
+      // Validate required fields
+      if (!documentType || !documentName || !filePath) {
+        return res.status(400).json({
+          status: 400,
+          message: 'Document type, name, and file path are required'
+        });
+      }
+  
+      // Check if tenant exists
+      const tenantCheck = await client.query(
+        'SELECT id FROM tenants WHERE id = $1',
+        [tenantId]
+      );
+  
+      if (tenantCheck.rows.length === 0) {
+        return res.status(404).json({
+          status: 404,
+          message: 'Tenant not found'
+        });
+      }
+  
+      // Insert document record
+      const documentQuery = `
+        INSERT INTO tenant_documents (
+          tenant_id, document_type, document_name, file_path,
+          file_size, mime_type, upload_date, uploaded_by
+        ) VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, $7)
+        RETURNING *
+      `;
+  
+      const result = await client.query(documentQuery, [
+        tenantId,
+        documentType,
+        documentName,
+        filePath,
+        fileSize,
+        mimeType,
+        req.user.username
+      ]);
+  
+      // Log activity
+      await client.query(
+        `INSERT INTO user_activity_log 
+         (user_id, activity_type, activity_description, affected_resource_type, affected_resource_id, ip_address, user_agent)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          req.user.id,
+          'document_uploaded',
+          `Uploaded document: ${documentName} for tenant`,
+          'tenant_document',
+          result.rows[0].id,
+          req.ip,
+          req.headers['user-agent']
+        ]
+      );
+  
+      res.status(201).json({
+        status: 201,
+        message: 'Document uploaded successfully',
+        data: result.rows[0]
+      });
+  
+    } catch (error) {
+      console.error('Document upload error:', error);
+      
+      res.status(500).json({
+        status: 500,
+        message: 'Failed to upload document',
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      });
+    } finally {
+      client.release();
+    }
+  });
+  
+  // Search tenants
+  router.get('/search/:query', authenticateTokenSimple, async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+      const searchQuery = req.params.query;
+  
+      const tenantsQuery = `
+        SELECT 
+          t.id,
+          t.first_name,
+          t.last_name,
+          t.email,
+          t.phone,
+          p.property_name,
+          u.unit_number,
+          l.lease_status
+        FROM tenants t
+        LEFT JOIN lease_tenants lt ON t.id = lt.tenant_id AND lt.removed_date IS NULL
+        LEFT JOIN leases l ON lt.lease_id = l.id
+        LEFT JOIN units u ON l.unit_id = u.id
+        LEFT JOIN properties p ON u.property_id = p.id
+        WHERE 
+          t.first_name ILIKE $1 OR 
+          t.last_name ILIKE $1 OR 
+          t.email ILIKE $1 OR
+          p.property_name ILIKE $1 OR
+          u.unit_number ILIKE $1
+        ORDER BY t.first_name, t.last_name
+      `;
+  
+      const result = await client.query(tenantsQuery, [`%${searchQuery}%`]);
+  
+      res.status(200).json({
+        status: 200,
+        message: 'Search results retrieved successfully',
+        data: result.rows
+      });
+  
+    } catch (error) {
+      console.error('Tenant search error:', error);
+      
+      res.status(500).json({
+        status: 500,
+        message: 'Failed to search tenants',
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      });
+    } finally {
+      client.release();
+    }
+  });
+
+  // Add these routes to your existing tenant routes file
+
+// Get available properties and units for onboarding
+router.get('/onboarding/available-units', authenticateTokenSimple, async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+      console.log('Fetching available units for tenant onboarding');
+  
+      // Get properties with available units
+      const propertiesQuery = `
+        SELECT 
+          p.id as property_id,
+          p.property_name,
+          p.address,
+          p.property_type,
+          p.total_units,
+          p.monthly_rent as base_monthly_rent,
+          p.security_deposit as base_security_deposit,
+          
+          -- Count available units
+          COUNT(CASE WHEN u.occupancy_status = 'vacant' THEN 1 END) as available_units,
+          COUNT(u.id) as actual_units,
+          
+          -- Get amenities
+          COALESCE(
+            JSON_AGG(
+              DISTINCT a.name 
+              ORDER BY a.name
+            ) FILTER (WHERE a.name IS NOT NULL), 
+            '[]'::json
+          ) as amenities
+          
+        FROM properties p
+        LEFT JOIN units u ON p.id = u.property_id
+        LEFT JOIN property_amenities pa ON p.id = pa.property_id
+        LEFT JOIN amenities a ON pa.amenity_id = a.id
+        GROUP BY p.id, p.property_name, p.address, p.property_type, p.total_units, p.monthly_rent, p.security_deposit
+        HAVING COUNT(CASE WHEN u.occupancy_status = 'vacant' THEN 1 END) > 0
+        ORDER BY p.property_name
+      `;
+  
+      const propertiesResult = await client.query(propertiesQuery);
+  
+      // Get detailed unit information for each property
+      const unitsQuery = `
+        SELECT 
+          u.id as unit_id,
+          u.property_id,
+          u.unit_number,
+          u.bedrooms,
+          u.bathrooms,
+          u.size_sq_ft,
+          u.monthly_rent,
+          u.security_deposit,
+          u.occupancy_status,
+          
+          -- Property information
+          p.property_name,
+          p.property_type,
+          
+          -- Check if there are any pending lease applications for this unit
+          (
+            SELECT COUNT(*) 
+            FROM leases l 
+            WHERE l.unit_id = u.id 
+            AND l.lease_status = 'draft'
+          ) as pending_applications
+          
+        FROM units u
+        JOIN properties p ON u.property_id = p.id
+        WHERE u.occupancy_status = 'vacant'
+        ORDER BY p.property_name, u.unit_number
+      `;
+  
+      const unitsResult = await client.query(unitsQuery);
+  
+      // Group units by property
+      const unitsByProperty = {};
+      unitsResult.rows.forEach(unit => {
+        if (!unitsByProperty[unit.property_id]) {
+          unitsByProperty[unit.property_id] = [];
+        }
+        unitsByProperty[unit.property_id].push({
+          id: unit.unit_id,
+          unitNumber: unit.unit_number,
+          bedrooms: unit.bedrooms,
+          bathrooms: unit.bathrooms,
+          sizeSquareFt: unit.size_sq_ft,
+          monthlyRent: parseFloat(unit.monthly_rent) || 0,
+          securityDeposit: parseFloat(unit.security_deposit) || 0,
+          occupancyStatus: unit.occupancy_status,
+          pendingApplications: parseInt(unit.pending_applications) || 0
+        });
+      });
+  
+      // Format properties with their available units
+      const formattedProperties = propertiesResult.rows.map(property => ({
+        id: property.property_id,
+        propertyName: property.property_name,
+        address: property.address,
+        propertyType: property.property_type,
+        totalUnits: property.total_units,
+        availableUnits: parseInt(property.available_units),
+        actualUnits: parseInt(property.actual_units),
+        baseMonthlyRent: parseFloat(property.base_monthly_rent) || 0,
+        baseSecurityDeposit: parseFloat(property.base_security_deposit) || 0,
+        amenities: property.amenities || [],
+        units: unitsByProperty[property.property_id] || []
+      }));
+  
+      res.status(200).json({
+        status: 200,
+        message: 'Available units retrieved successfully',
+        data: {
+          properties: formattedProperties,
+          totalAvailableUnits: unitsResult.rows.length
+        }
+      });
+  
+    } catch (error) {
+      console.error('Available units fetch error:', error);
+      
+      res.status(500).json({
+        status: 500,
+        message: 'Failed to fetch available units',
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      });
+    } finally {
+      client.release();
+    }
+  });
+  
+  // Get specific unit details for lease creation
+  router.get('/onboarding/units/:unitId/details', authenticateTokenSimple, async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+      const unitId = req.params.unitId;
+  
+      const unitQuery = `
+        SELECT 
+          u.id as unit_id,
+          u.unit_number,
+          u.bedrooms,
+          u.bathrooms,
+          u.size_sq_ft,
+          u.monthly_rent,
+          u.security_deposit,
+          u.occupancy_status,
+          
+          -- Property details
+          p.id as property_id,
+          p.property_name,
+          p.address,
+          p.property_type,
+          p.description,
+          
+          -- Property amenities
+          COALESCE(
+            JSON_AGG(
+              DISTINCT a.name 
+              ORDER BY a.name
+            ) FILTER (WHERE a.name IS NOT NULL), 
+            '[]'::json
+          ) as amenities,
+          
+          -- Unit utilities
+          COALESCE(
+            JSON_AGG(
+              DISTINCT ut.name 
+              ORDER BY ut.name
+            ) FILTER (WHERE ut.name IS NOT NULL AND uu.included = true), 
+            '[]'::json
+          ) as included_utilities
+          
+        FROM units u
+        JOIN properties p ON u.property_id = p.id
+        LEFT JOIN property_amenities pa ON p.id = pa.property_id
+        LEFT JOIN amenities a ON pa.amenity_id = a.id
+        LEFT JOIN unit_utilities uu ON u.id = uu.unit_id
+        LEFT JOIN utilities ut ON uu.utility_id = ut.id
+        WHERE u.id = $1
+        GROUP BY u.id, u.unit_number, u.bedrooms, u.bathrooms, u.size_sq_ft, 
+                 u.monthly_rent, u.security_deposit, u.occupancy_status,
+                 p.id, p.property_name, p.address, p.property_type, p.description
+      `;
+  
+      const result = await client.query(unitQuery, [unitId]);
+  
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          status: 404,
+          message: 'Unit not found'
+        });
+      }
+  
+      const unit = result.rows[0];
+  
+      // Check if unit is available
+      if (unit.occupancy_status !== 'vacant') {
+        return res.status(400).json({
+          status: 400,
+          message: 'Unit is not available for lease'
+        });
+      }
+  
+      res.status(200).json({
+        status: 200,
+        message: 'Unit details retrieved successfully',
+        data: {
+          unitId: unit.unit_id,
+          unitNumber: unit.unit_number,
+          bedrooms: unit.bedrooms,
+          bathrooms: unit.bathrooms,
+          sizeSquareFt: unit.size_sq_ft,
+          monthlyRent: parseFloat(unit.monthly_rent) || 0,
+          securityDeposit: parseFloat(unit.security_deposit) || 0,
+          occupancyStatus: unit.occupancy_status,
+          property: {
+            id: unit.property_id,
+            name: unit.property_name,
+            address: unit.address,
+            type: unit.property_type,
+            description: unit.description
+          },
+          amenities: unit.amenities || [],
+          includedUtilities: unit.included_utilities || []
+        }
+      });
+  
+    } catch (error) {
+      console.error('Unit details fetch error:', error);
+      
+      res.status(500).json({
+        status: 500,
+        message: 'Failed to fetch unit details',
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      });
+    } finally {
+      client.release();
+    }
+  });
+  
+  // Reserve unit temporarily during onboarding process
+  router.post('/onboarding/units/:unitId/reserve', authenticateTokenSimple, async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+      await client.query('BEGIN');
+      
+      const unitId = req.params.unitId;
+      const { tenantEmail, reservationNotes } = req.body;
+  
+      // Check if unit is available
+      const unitCheck = await client.query(
+        'SELECT id, occupancy_status FROM units WHERE id = $1',
+        [unitId]
+      );
+  
+      if (unitCheck.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({
+          status: 404,
+          message: 'Unit not found'
+        });
+      }
+  
+      if (unitCheck.rows[0].occupancy_status !== 'vacant') {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          status: 400,
+          message: 'Unit is not available for reservation'
+        });
+      }
+  
+      // Create a draft lease as a reservation
+      const reservationQuery = `
+        INSERT INTO leases (
+          unit_id, lease_status, start_date, monthly_rent, 
+          security_deposit, lease_terms, created_at
+        ) 
+        SELECT 
+          u.id,
+          'draft',
+          CURRENT_DATE + INTERVAL '7 days', -- Tentative start date
+          u.monthly_rent,
+          u.security_deposit,
+          $1,
+          CURRENT_TIMESTAMP
+        FROM units u 
+        WHERE u.id = $2
+        RETURNING id, lease_number
+      `;
+  
+      const reservationResult = await client.query(reservationQuery, [
+        `Temporary reservation for ${tenantEmail}. ${reservationNotes || ''}`,
+        unitId
+      ]);
+  
+      // Log the reservation
+      await client.query(
+        `INSERT INTO user_activity_log 
+         (user_id, activity_type, activity_description, affected_resource_type, affected_resource_id, ip_address, user_agent)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          req.user.id,
+          'unit_reserved',
+          `Reserved unit for tenant onboarding: ${tenantEmail}`,
+          'unit',
+          unitId,
+          req.ip,
+          req.headers['user-agent']
+        ]
+      );
+  
+      await client.query('COMMIT');
+  
+      res.status(200).json({
+        status: 200,
+        message: 'Unit reserved successfully',
+        data: {
+          reservationId: reservationResult.rows[0].id,
+          leaseNumber: reservationResult.rows[0].lease_number,
+          unitId: unitId,
+          reservedFor: tenantEmail,
+          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000) // 24 hours from now
+        }
+      });
+  
+    } catch (error) {
+      await client.query('ROLLBACK');
+      console.error('Unit reservation error:', error);
+      
+      res.status(500).json({
+        status: 500,
+        message: 'Failed to reserve unit',
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      });
+    } finally {
+      client.release();
+    }
+  });
+
+  // Enhanced tenant creation route with unit allocation
+router.post('/onboard-with-unit', authenticateTokenSimple, async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+      await client.query('BEGIN');
+  
+      const {
+        // Tenant information
+        firstName,
+        lastName,
+        email,
+        phone,
+        alternatePhone,
+        dateOfBirth,
+        identificationType,
+        identificationNumber,
+        emergencyContactName,
+        emergencyContactPhone,
+        emergencyContactRelationship,
+        employmentStatus,
+        employerName,
+        monthlyIncome,
+        previousAddress,
+        
+        // Unit and lease information
+        selectedUnitId,
+        leaseStart,
+        leaseEnd,
+        leaseType = 'Fixed Term',
+        customMonthlyRent, // Optional: override unit's default rent
+        customSecurityDeposit, // Optional: override unit's default deposit
+        petDeposit = 0,
+        lateFee = 0,
+        gracePeriodDays = 5,
+        rentDueDay = 1,
+        leaseTerms,
+        specialConditions,
+        moveInDate,
+        
+        // Co-tenants (optional)
+        coTenants = [], // Array of additional tenant information
+        
+        // Reservation ID (if unit was previously reserved)
+        reservationId
+      } = req.body;
+  
+      // Validate required fields
+      if (!firstName || !lastName || !email || !selectedUnitId || !leaseStart) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          status: 400,
+          message: 'Required fields: firstName, lastName, email, selectedUnitId, leaseStart'
+        });
+      }
+  
+      // Check if email already exists
+      const emailCheck = await client.query(
+        'SELECT id FROM tenants WHERE email = $1',
+        [email]
+      );
+  
+      if (emailCheck.rows.length > 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          status: 400,
+          message: 'Email already exists'
+        });
+      }
+  
+      // Get unit details and verify availability
+      const unitQuery = `
+        SELECT 
+          u.id, u.unit_number, u.monthly_rent, u.security_deposit, u.occupancy_status,
+          p.id as property_id, p.property_name, p.address
+        FROM units u
+        JOIN properties p ON u.property_id = p.id
+        WHERE u.id = $1
+      `;
+  
+      const unitResult = await client.query(unitQuery, [selectedUnitId]);
+  
+      if (unitResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({
+          status: 404,
+          message: 'Selected unit not found'
+        });
+      }
+  
+      const selectedUnit = unitResult.rows[0];
+  
+      // Check if unit is available (unless it's reserved by this process)
+      if (selectedUnit.occupancy_status !== 'vacant') {
+        // Check if there's a valid reservation
+        if (reservationId) {
+          const reservationCheck = await client.query(
+            'SELECT id FROM leases WHERE id = $1 AND unit_id = $2 AND lease_status = $3',
+            [reservationId, selectedUnitId, 'draft']
+          );
+          
+          if (reservationCheck.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+              status: 400,
+              message: 'Unit reservation not found or expired'
+            });
+          }
+        } else {
+          await client.query('ROLLBACK');
+          return res.status(400).json({
+            status: 400,
+            message: 'Selected unit is not available'
+          });
+        }
+      }
+  
+      // Create primary tenant
+      const tenantQuery = `
+        INSERT INTO tenants (
+          first_name, last_name, email, phone, alternate_phone,
+          date_of_birth, identification_type, identification_number,
+          emergency_contact_name, emergency_contact_phone, emergency_contact_relationship,
+          employment_status, employer_name, monthly_income, previous_address
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        RETURNING *
+      `;
+  
+      const tenantResult = await client.query(tenantQuery, [
+        firstName, lastName, email, phone, alternatePhone,
+        dateOfBirth, identificationType, identificationNumber,
+        emergencyContactName, emergencyContactPhone, emergencyContactRelationship,
+        employmentStatus, employerName, monthlyIncome, previousAddress
+      ]);
+  
+      const primaryTenant = tenantResult.rows[0];
+  
+      // Determine lease amounts (use custom amounts if provided, otherwise use unit defaults)
+      const finalMonthlyRent = customMonthlyRent || selectedUnit.monthly_rent;
+      const finalSecurityDeposit = customSecurityDeposit || selectedUnit.security_deposit;
+  
+      // Create or update lease
+      let leaseId;
+      if (reservationId) {
+        // Update the existing draft lease
+        const updateLeaseQuery = `
+          UPDATE leases SET 
+            lease_status = 'active',
+            lease_type = $1,
+            start_date = $2,
+            end_date = $3,
+            monthly_rent = $4,
+            security_deposit = $5,
+            pet_deposit = $6,
+            late_fee = $7,
+            grace_period_days = $8,
+            rent_due_day = $9,
+            lease_terms = $10,
+            special_conditions = $11,
+            signed_date = CURRENT_DATE,
+            move_in_date = $12,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE id = $13
+          RETURNING *
+        `;
+  
+        const leaseResult = await client.query(updateLeaseQuery, [
+          leaseType, leaseStart, leaseEnd, finalMonthlyRent, finalSecurityDeposit,
+          petDeposit, lateFee, gracePeriodDays, rentDueDay,
+          leaseTerms, specialConditions, moveInDate, reservationId
+        ]);
+  
+        leaseId = reservationId;
+      } else {
+        // Create new lease
+        const createLeaseQuery = `
+          INSERT INTO leases (
+            unit_id, lease_type, lease_status, start_date, end_date, monthly_rent,
+            security_deposit, pet_deposit, late_fee, grace_period_days, rent_due_day,
+            lease_terms, special_conditions, signed_date, move_in_date
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+          RETURNING *
+        `;
+  
+        const leaseResult = await client.query(createLeaseQuery, [
+          selectedUnitId, leaseType, 'active', leaseStart, leaseEnd, finalMonthlyRent,
+          finalSecurityDeposit, petDeposit, lateFee, gracePeriodDays, rentDueDay,
+          leaseTerms, specialConditions, new Date(), moveInDate
+        ]);
+  
+        leaseId = leaseResult.rows[0].id;
+      }
+  
+      // Link primary tenant to lease
+      await client.query(
+        'INSERT INTO lease_tenants (lease_id, tenant_id, is_primary_tenant, tenant_type) VALUES ($1, $2, $3, $4)',
+        [leaseId, primaryTenant.id, true, 'Tenant']
+      );
+  
+      // Add co-tenants if provided
+      const coTenantIds = [];
+      for (const coTenant of coTenants) {
+        // Check if co-tenant email already exists
+        const coTenantEmailCheck = await client.query(
+          'SELECT id FROM tenants WHERE email = $1',
+          [coTenant.email]
+        );
+  
+        let coTenantId;
+        if (coTenantEmailCheck.rows.length > 0) {
+          // Use existing tenant
+          coTenantId = coTenantEmailCheck.rows[0].id;
+        } else {
+          // Create new co-tenant
+          const coTenantResult = await client.query(tenantQuery, [
+            coTenant.firstName, coTenant.lastName, coTenant.email, 
+            coTenant.phone, coTenant.alternatePhone, coTenant.dateOfBirth,
+            coTenant.identificationType, coTenant.identificationNumber,
+            coTenant.emergencyContactName, coTenant.emergencyContactPhone, 
+            coTenant.emergencyContactRelationship, coTenant.employmentStatus,
+            coTenant.employerName, coTenant.monthlyIncome, coTenant.previousAddress
+          ]);
+          coTenantId = coTenantResult.rows[0].id;
+        }
+  
+        // Link co-tenant to lease
+        await client.query(
+          'INSERT INTO lease_tenants (lease_id, tenant_id, is_primary_tenant, tenant_type) VALUES ($1, $2, $3, $4)',
+          [leaseId, coTenantId, false, coTenant.tenantType || 'Co-Tenant']
+        );
+  
+        coTenantIds.push(coTenantId);
+      }
+  
+      // Update unit status to occupied
+      await client.query(
+        'UPDATE units SET occupancy_status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+        ['occupied', selectedUnitId]
+      );
+  
+      // Create security deposit record
+      await client.query(
+        `INSERT INTO security_deposits (
+          lease_id, deposit_type, amount_collected, collection_date, status
+        ) VALUES ($1, $2, $3, $4, $5)`,
+        [leaseId, 'Security', finalSecurityDeposit, moveInDate || leaseStart, 'held']
+      );
+  
+      // Log activity
+      await client.query(
+        `INSERT INTO user_activity_log 
+         (user_id, activity_type, activity_description, affected_resource_type, affected_resource_id, ip_address, user_agent)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          req.user.id,
+          'tenant_onboarded_with_unit',
+          `Onboarded tenant: ${firstName} ${lastName} to ${selectedUnit.property_name} Unit ${selectedUnit.unit_number}`,
+          'tenant',
+          primaryTenant.id,
+          req.ip,
+          req.headers['user-agent']
+        ]
+      );
+  
+      await client.query('COMMIT');
+  
+      res.status(201).json({
+        status: 201,
+        message: 'Tenant onboarded successfully with unit allocation',
+        data: {
+          tenant: primaryTenant,
+          coTenants: coTenantIds,
+          lease: {
+            id: leaseId,
+            unitId: selectedUnitId,
+            unitNumber: selectedUnit.unit_number,
+            propertyName: selectedUnit.property_name,
+            monthlyRent: finalMonthlyRent,
+            securityDeposit: finalSecurityDeposit,
+            leaseStart,
+            leaseEnd,
+            moveInDate
+          }
+        }
+      });
+  
+    } catch (error) {
+      await client.query('ROLLBACK');
+      console.error('Tenant onboarding with unit allocation error:', error);
+      
+      res.status(500).json({
+        status: 500,
+        message: 'Failed to onboard tenant with unit allocation',
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      });
+    } finally {
+      client.release();
+    }
+  });
+  
+  export default router;
