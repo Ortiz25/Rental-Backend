@@ -136,11 +136,11 @@ router.get('/', authenticateTokenSimple, async (req, res) => {
         occupancyState: occupancyState,
         occupancyRate: parseFloat(property.occupancy_rate) || 0,
         
-        // Unit statistics
-        totalUnits: property.actual_units || property.total_units || 1,
-        occupiedUnits: parseInt(property.occupied_units) || 0,
-        vacantUnits: parseInt(property.vacant_units) || 0,
-        maintenanceUnits: parseInt(property.maintenance_units) || 0,
+        // Unit statistics - FIXED: Ensure these are numbers, not strings
+        totalUnits: parseInt(property.actual_units || property.total_units || 1, 10),
+        occupiedUnits: parseInt(property.occupied_units || 0, 10),
+        vacantUnits: parseInt(property.vacant_units || 0, 10),
+        maintenanceUnits: parseInt(property.maintenance_units || 0, 10),
         
         // Additional data
         amenities: amenitiesLookup[property.id] || [],
@@ -149,7 +149,7 @@ router.get('/', authenticateTokenSimple, async (req, res) => {
       };
     });
 
-    // Calculate portfolio statistics
+    // Calculate portfolio statistics - FIXED: Now properly sums numbers
     const portfolioStats = {
       totalProperties: formattedProperties.length,
       totalUnits: formattedProperties.reduce((sum, prop) => sum + prop.totalUnits, 0),

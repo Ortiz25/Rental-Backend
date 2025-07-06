@@ -144,6 +144,25 @@ router.get('/tenant/dashboard', authenticateTokenSimple, async (req, res) => {
       LIMIT 10
     `;
 
+    // Get payment submissions (pending verifications)
+    const paymentSubmissionsQuery = `
+      SELECT 
+        ps.id,
+        ps.amount,
+        ps.payment_method,
+        ps.transaction_reference,
+        ps.transaction_date,
+        ps.submission_date,
+        ps.verification_status,
+        ps.verified_date,
+        ps.admin_notes,
+        ps.notes as tenant_notes
+      FROM payment_submissions ps
+      WHERE ps.tenant_id = $1
+      ORDER BY ps.submission_date DESC
+      LIMIT 5
+    `;
+
     // Execute all queries
     console.log('📊 Executing tenant info query...');
     const tenantInfo = await client.query(tenantInfoQuery, [tenantId]);
@@ -162,6 +181,9 @@ router.get('/tenant/dashboard', authenticateTokenSimple, async (req, res) => {
     
     console.log('📄 Executing documents query...');
     const documents = await client.query(documentsQuery, [tenantId]);
+
+    console.log('💳 Executing payment submissions query...');
+    const paymentSubmissions = await client.query(paymentSubmissionsQuery, [tenantId]);
 
     // Check if tenant exists
     if (tenantInfo.rows.length === 0) {
@@ -293,12 +315,19 @@ router.get('/tenant/dashboard', authenticateTokenSimple, async (req, res) => {
   }
 });
 
-// Make payment route
-router.post('/tenant/payment', authenticateTokenSimple, async (req, res) => {
+// Submit payment verification route (replaces the direct payment processing)
+router.post('/tenant/payment/submit', authenticateTokenSimple, async (req, res) => {
   const client = await pool.connect();
   
   try {
-    const { amount, paymentMethod, paymentReference } = req.body;
+    const { 
+      amount, 
+      paymentMethod, 
+      reference, 
+      transactionDate, 
+      notes 
+    } = req.body;
+    
     const tenantId = req.user.tenant_id;
 
     if (!tenantId) {
@@ -308,78 +337,280 @@ router.post('/tenant/payment', authenticateTokenSimple, async (req, res) => {
       });
     }
 
-    // Find the oldest unpaid rent payment
-    const unpaidQuery = `
-      SELECT rp.id, rp.amount_due, rp.amount_paid
-      FROM rent_payments rp
-      JOIN leases l ON rp.lease_id = l.id
-      JOIN lease_tenants lt ON l.id = lt.lease_id AND lt.removed_date IS NULL
-      WHERE lt.tenant_id = $1 
-      AND rp.payment_status IN ('pending', 'overdue')
-      ORDER BY rp.due_date ASC
-      LIMIT 1
-    `;
-
-    const unpaidResult = await client.query(unpaidQuery, [tenantId]);
-    
-    if (unpaidResult.rows.length === 0) {
+    // Validate required fields
+    if (!amount || !paymentMethod || !reference || !transactionDate) {
       return res.status(400).json({
         status: 400,
-        message: 'No pending payments found'
+        message: 'Missing required payment details'
       });
     }
 
-    const payment = unpaidResult.rows[0];
-    const remainingAmount = payment.amount_due - payment.amount_paid;
-    const paymentAmount = Math.min(amount, remainingAmount);
-    const newTotalPaid = payment.amount_paid + paymentAmount;
-    const newStatus = newTotalPaid >= payment.amount_due ? 'paid' : 'partial';
-
-    // Update the payment
-    const updateQuery = `
-      UPDATE rent_payments 
-      SET 
-        amount_paid = $1,
-        payment_status = $2,
-        payment_method = $3,
-        payment_reference = $4,
-        payment_date = CASE WHEN $2 = 'paid' THEN CURRENT_DATE ELSE payment_date END,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = $5
-      RETURNING *
+    // Find the tenant's current lease and unit
+    const leaseQuery = `
+      SELECT l.id as lease_id, l.unit_id, l.monthly_rent
+      FROM leases l
+      JOIN lease_tenants lt ON l.id = lt.lease_id AND lt.removed_date IS NULL
+      WHERE lt.tenant_id = $1 AND l.lease_status = 'active'
+      LIMIT 1
     `;
 
-    await client.query(updateQuery, [
-      newTotalPaid,
-      newStatus,
+    const leaseResult = await client.query(leaseQuery, [tenantId]);
+    
+    if (leaseResult.rows.length === 0) {
+      return res.status(400).json({
+        status: 400,
+        message: 'No active lease found for tenant'
+      });
+    }
+
+    const { lease_id } = leaseResult.rows[0];
+
+    // Create a payment submission record (pending verification)
+    const insertQuery = `
+      INSERT INTO payment_submissions 
+      (
+        tenant_id, 
+        lease_id, 
+        amount, 
+        payment_method, 
+        transaction_reference, 
+        transaction_date, 
+        submission_date,
+        verification_status,
+        notes,
+        submitted_by
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, 'pending', $7, $8)
+      RETURNING id, submission_date
+    `;
+
+    const result = await client.query(insertQuery, [
+      tenantId,
+      lease_id,
+      amount,
       paymentMethod,
-      paymentReference,
-      payment.id
+      reference,
+      transactionDate,
+      notes,
+      req.user.id
     ]);
 
     // Log the activity
     const logQuery = `
       INSERT INTO user_activity_log (user_id, activity_type, activity_description)
-      VALUES ($1, 'payment_made', 'Payment of $${paymentAmount} made via ${paymentMethod}')
+      VALUES ($1, 'payment_submitted', $2)
     `;
     
-    await client.query(logQuery, [req.user.id]);
+    await client.query(logQuery, [
+      req.user.id,
+      `Payment submission of ${amount} via ${paymentMethod} (Ref: ${reference})`
+    ]);
 
-    res.status(200).json({
-      status: 200,
-      message: 'Payment processed successfully',
+    // Create notification for tenant
+    const notificationQuery = `
+      INSERT INTO user_notifications 
+      (user_id, notification_type, title, message, related_resource_type, related_resource_id)
+      VALUES ($1, 'payment_submitted', 'Payment Submitted', $2, 'payment_submission', $3)
+    `;
+    
+    await client.query(notificationQuery, [
+      req.user.id,
+      `Your payment of ${amount} has been submitted for verification. You will be notified once it's confirmed.`,
+      result.rows[0].id
+    ]);
+
+    res.status(201).json({
+      status: 201,
+      message: 'Payment submitted successfully for verification',
       data: {
-        paymentAmount: paymentAmount,
-        newStatus: newStatus,
-        remainingBalance: payment.amount_due - newTotalPaid
+        submissionId: result.rows[0].id,
+        submissionDate: result.rows[0].submission_date,
+        verificationStatus: 'pending',
+        estimatedVerificationTime: '24 hours'
       }
     });
 
   } catch (error) {
-    console.error('❌ Payment processing error:', error);
+    console.error('❌ Payment submission error:', error);
     res.status(500).json({
       status: 500,
-      message: 'Failed to process payment',
+      message: 'Failed to submit payment for verification',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// Get payment methods and details route
+router.get('/tenant/payment-methods', authenticateTokenSimple, async (req, res) => {
+  try {
+    const tenantId = req.user.tenant_id;
+
+    if (!tenantId) {
+      return res.status(403).json({
+        status: 403,
+        message: 'Access denied. User is not associated with a tenant account.'
+      });
+    }
+
+    // Get tenant's lease number for payment reference
+    const client = await pool.connect();
+    
+    try {
+      const leaseQuery = `
+        SELECT l.lease_number
+        FROM leases l
+        JOIN lease_tenants lt ON l.id = lt.lease_id AND lt.removed_date IS NULL
+        WHERE lt.tenant_id = $1 AND l.lease_status = 'active'
+        LIMIT 1
+      `;
+
+      const leaseResult = await client.query(leaseQuery, [tenantId]);
+      const leaseNumber = leaseResult.rows[0]?.lease_number || 'LEASE001';
+
+      // Return available payment methods with details
+      const paymentMethods = {
+        bank_transfer: {
+          name: "Bank Transfer",
+          details: {
+            bankName: "ABC Bank Ltd",
+            accountName: "Urban Properties Management",
+            accountNumber: "1234567890",
+            branchCode: "001",
+            swiftCode: "ABCBKENX",
+            reference: leaseNumber
+          },
+          instructions: [
+            "Transfer the exact amount to the account above",
+            "Use your lease number as the payment reference",
+            "Keep your transaction receipt",
+            "Submit payment details after transfer"
+          ]
+        },
+        mpesa: {
+          name: "M-Pesa",
+          details: {
+            paybillNumber: "400200",
+            businessName: "Urban Properties",
+            accountNumber: leaseNumber
+          },
+          instructions: [
+            "Go to M-Pesa menu on your phone",
+            "Select 'Lipa na M-Pesa' then 'Pay Bill'",
+            "Enter Business Number: 400200",
+            `Enter Account Number: ${leaseNumber}`,
+            "Enter the amount and complete payment",
+            "You'll receive an SMS confirmation",
+            "Submit the M-Pesa code below"
+          ]
+        },
+        airtel_money: {
+          name: "Airtel Money",
+          details: {
+            merchantCode: "500300",
+            businessName: "Urban Properties",
+            accountNumber: leaseNumber
+          },
+          instructions: [
+            "Dial *334# on your Airtel line",
+            "Select 'Pay Bills'",
+            "Enter Merchant Code: 500300",
+            `Enter Reference: ${leaseNumber}`,
+            "Enter amount and confirm payment",
+            "Save the transaction ID from SMS",
+            "Submit transaction details"
+          ]
+        }
+      };
+
+      res.status(200).json({
+        status: 200,
+        message: 'Payment methods retrieved successfully',
+        data: {
+          paymentMethods,
+          leaseNumber,
+          verificationNote: "All payments require admin verification within 24 hours"
+        }
+      });
+
+    } finally {
+      client.release();
+    }
+
+  } catch (error) {
+    console.error('❌ Payment methods fetch error:', error);
+    res.status(500).json({
+      status: 500,
+      message: 'Failed to fetch payment methods',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Get payment submissions history
+router.get('/tenant/payment-submissions', authenticateTokenSimple, async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    const tenantId = req.user.tenant_id;
+
+    if (!tenantId) {
+      return res.status(403).json({
+        status: 403,
+        message: 'Access denied. User is not associated with a tenant account.'
+      });
+    }
+
+    const submissionsQuery = `
+      SELECT 
+        ps.id,
+        ps.amount,
+        ps.payment_method,
+        ps.transaction_reference,
+        ps.transaction_date,
+        ps.submission_date,
+        ps.verification_status,
+        ps.verified_date,
+        ps.verified_by,
+        ps.admin_notes,
+        ps.notes as tenant_notes,
+        l.lease_number
+      FROM payment_submissions ps
+      JOIN leases l ON ps.lease_id = l.id
+      WHERE ps.tenant_id = $1
+      ORDER BY ps.submission_date DESC
+      LIMIT 20
+    `;
+
+    const result = await client.query(submissionsQuery, [tenantId]);
+
+    res.status(200).json({
+      status: 200,
+      message: 'Payment submissions retrieved successfully',
+      data: result.rows.map(submission => ({
+        id: submission.id,
+        amount: parseFloat(submission.amount),
+        paymentMethod: submission.payment_method,
+        transactionReference: submission.transaction_reference,
+        transactionDate: submission.transaction_date,
+        submissionDate: submission.submission_date,
+        verificationStatus: submission.verification_status,
+        verifiedDate: submission.verified_date,
+        verifiedBy: submission.verified_by,
+        adminNotes: submission.admin_notes,
+        tenantNotes: submission.tenant_notes,
+        leaseNumber: submission.lease_number,
+        statusColor: submission.verification_status === 'verified' ? 'green' :
+                    submission.verification_status === 'rejected' ? 'red' : 'yellow'
+      }))
+    });
+
+  } catch (error) {
+    console.error('❌ Payment submissions fetch error:', error);
+    res.status(500).json({
+      status: 500,
+      message: 'Failed to fetch payment submissions',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   } finally {

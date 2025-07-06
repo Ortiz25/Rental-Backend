@@ -20,6 +20,9 @@ import communicationRoutes from "./src/routes/communication.js"
 import paymentRoutes from "./src/routes/payments.js"
 import financialRoutes from "./src/routes/financialReports.js"
 import tenantDashRoutes from "./src/routes/tenantDashboard.js"
+import rentCollectionRoutes from "./src/routes/rentCollectionRoutes.js"
+import paymentVerificationRoutes from "./src/routes/paymentVerificatioRoutes.js"
+import docmentRoutes from "./src/routes/documents.js"
 
 const app = express();
 
@@ -51,6 +54,9 @@ app.use("/api/communications", communicationRoutes);
 app.use("/api/rent-collection", paymentRoutes);
 app.use("/api/financial", financialRoutes);
 app.use("/api/tenant-dash", tenantDashRoutes);
+app.use('/api/rent', rentCollectionRoutes);
+app.use('/api/payment-verification', paymentVerificationRoutes)
+app.use('/api/documents', docmentRoutes)
 
 
 

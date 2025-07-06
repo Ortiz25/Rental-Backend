@@ -323,6 +323,7 @@ router.post('/messages', authenticateTokenSimple, async (req, res) => {
 });
 
 // Get communication statistics
+
 router.get('/stats', authenticateTokenSimple, async (req, res) => {
   console.log('📊 Getting communication stats for user:', req.user?.id);
   
@@ -350,12 +351,15 @@ router.get('/stats', authenticateTokenSimple, async (req, res) => {
       ${whereClause}
     `;
     
+    // FIXED: Separate notification stats to properly distinguish announcements from other notifications
     let notificationStatsQuery = `
       SELECT 
         COUNT(*) as total_notifications,
         COUNT(CASE WHEN is_read = false THEN 1 END) as unread_notifications,
         COUNT(CASE WHEN notification_type = 'announcement' THEN 1 END) as announcements,
-        COUNT(CASE WHEN is_urgent = true THEN 1 END) as urgent_notifications
+        COUNT(CASE WHEN notification_type = 'announcement' AND is_read = false THEN 1 END) as unread_announcements,
+        COUNT(CASE WHEN is_urgent = true THEN 1 END) as urgent_notifications,
+        COUNT(CASE WHEN notification_type = 'announcement' AND is_urgent = true THEN 1 END) as urgent_announcements
       FROM user_notifications
     `;
     
@@ -378,15 +382,20 @@ router.get('/stats', authenticateTokenSimple, async (req, res) => {
         pendingFollowups: parseInt(statsResult.rows[0].pending_followups) || 0,
         thisWeek: parseInt(statsResult.rows[0].messages_this_week) || 0,
         thisMonth: parseInt(statsResult.rows[0].messages_this_month) || 0,
-        unread: parseInt(statsResult.rows[0].pending_followups) || 0 // Using pending followups as "unread" for now
+        unread: parseInt(statsResult.rows[0].pending_followups) || 0 // Using pending followups as "unread" for messages
       },
       notifications: {
         total: parseInt(notificationResult.rows[0].total_notifications) || 0,
         unread: parseInt(notificationResult.rows[0].unread_notifications) || 0,
         announcements: parseInt(notificationResult.rows[0].announcements) || 0,
-        urgent: parseInt(notificationResult.rows[0].urgent_notifications) || 0
+        unreadAnnouncements: parseInt(notificationResult.rows[0].unread_announcements) || 0,
+        urgent: parseInt(notificationResult.rows[0].urgent_notifications) || 0,
+        urgentAnnouncements: parseInt(notificationResult.rows[0].urgent_announcements) || 0
       }
     };
+    
+    // Log for debugging
+    console.log('📊 Calculated stats:', stats);
     
     res.status(200).json({
       status: 200,

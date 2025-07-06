@@ -232,17 +232,17 @@ router.get('/dashboard/test', async (req, res) => {
             stats: [
               { 
                 label: 'Monthly Revenue', 
-                value: `$${(parseFloat(financialData.monthly_revenue) || 0).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`, 
+                value: `KES ${(parseFloat(financialData.monthly_revenue) || 0).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`, 
                 color: 'bg-blue-100' 
               },
               { 
                 label: 'Outstanding Rent', 
-                value: `$${(parseFloat(financialData.outstanding_rent) || 0).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`, 
+                value: `KES ${(parseFloat(financialData.outstanding_rent) || 0).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`, 
                 color: 'bg-red-100' 
               },
               { 
                 label: 'Maintenance Costs', 
-                value: `$${(parseFloat(financialData.maintenance_costs_this_month) || 0).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`, 
+                value: `KES ${(parseFloat(financialData.maintenance_costs_this_month) || 0).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`, 
                 color: 'bg-yellow-100' 
               }
             ]
