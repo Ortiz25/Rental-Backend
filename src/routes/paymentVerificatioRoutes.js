@@ -430,7 +430,9 @@ router.get('/payment-submissions/:id', authenticateTokenSimple, async (req, res)
   }
 });
 
+
 // Verify payment submission
+
 router.put('/payment-submissions/:id/verify', authenticateTokenSimple, async (req, res) => {
   console.log('✅ Verifying payment submission ID:', req.params.id);
   
@@ -463,11 +465,10 @@ router.put('/payment-submissions/:id/verify', authenticateTokenSimple, async (re
 
     await client.query('BEGIN');
 
-    // First, get the submission details
+    // ✅ Fixed: Get the submission details - removed the problematic l.lease_id
     const submissionQuery = `
-      SELECT ps.*, l.lease_id
+      SELECT ps.*, ps.lease_id as lease_id
       FROM payment_submissions ps
-      JOIN leases l ON ps.lease_id = l.id
       WHERE ps.id = $1 AND ps.verification_status = 'pending'
     `;
 

@@ -4,6 +4,160 @@ import { authenticateToken,authorizeRole, authenticateTokenSimple} from '../midd
 
 const router = express.Router();
 
+// Get available amenities - MOVED BEFORE parameterized routes
+router.get('/amenities', authenticateTokenSimple, async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    const result = await client.query('SELECT * FROM amenities ORDER BY name');
+    
+    res.status(200).json({
+      status: 200,
+      message: 'Amenities retrieved successfully',
+      data: result.rows
+    });
+
+  } catch (error) {
+    console.error('Amenities fetch error:', error);
+    
+    res.status(500).json({
+      status: 500,
+      message: 'Failed to fetch amenities'
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// Create new property - MOVED BEFORE parameterized routes
+router.post('/', authenticateTokenSimple, authorizeRole(['Super Admin', 'Admin', 'Manager']), async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+
+    const {
+      propertyName,
+      address,
+      propertyType,
+      totalUnits = 1,
+      sizeSquareFt,
+      monthlyRent,
+      securityDeposit,
+      description,
+      amenities = [],
+      units = []
+    } = req.body;
+
+    // Validate required fields
+    if (!propertyName || !address || !propertyType) {
+      return res.status(400).json({
+        status: 400,
+        message: 'Property name, address, and type are required'
+      });
+    }
+
+    // Insert property
+    const propertyQuery = `
+      INSERT INTO properties (
+        property_name, address, property_type, total_units, 
+        size_sq_ft, monthly_rent, security_deposit, description
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING *
+    `;
+
+    const propertyResult = await client.query(propertyQuery, [
+      propertyName,
+      address,
+      propertyType,
+      totalUnits,
+      sizeSquareFt,
+      monthlyRent,
+      securityDeposit,
+      description
+    ]);
+
+    const newProperty = propertyResult.rows[0];
+
+    // Add amenities if provided
+    if (amenities && amenities.length > 0) {
+      for (const amenityName of amenities) {
+        // Get or create amenity
+        const amenityResult = await client.query(
+          'INSERT INTO amenities (name) VALUES ($1) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id',
+          [amenityName]
+        );
+        
+        const amenityId = amenityResult.rows[0].id;
+        
+        // Link to property
+        await client.query(
+          'INSERT INTO property_amenities (property_id, amenity_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+          [newProperty.id, amenityId]
+        );
+      }
+    }
+
+    // Add units if provided, otherwise the trigger will create a default unit for single-unit properties
+    if (units && units.length > 0) {
+      for (const unit of units) {
+        await client.query(
+          `INSERT INTO units (
+            property_id, unit_number, bedrooms, bathrooms, 
+            size_sq_ft, monthly_rent, security_deposit, occupancy_status
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [
+            newProperty.id,
+            unit.unitNumber || 'Main',
+            unit.bedrooms || 0,
+            unit.bathrooms || 0,
+            unit.sizeSquareFt || sizeSquareFt,
+            unit.monthlyRent || monthlyRent,
+            unit.securityDeposit || securityDeposit,
+            unit.occupancyStatus || 'vacant'
+          ]
+        );
+      }
+    }
+
+    // Log activity
+    await client.query(
+      `INSERT INTO user_activity_log 
+       (user_id, activity_type, activity_description, affected_resource_type, affected_resource_id, ip_address, user_agent)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        req.user.id,
+        'property_created',
+        `Created new property: ${propertyName}`,
+        'property',
+        newProperty.id,
+        req.ip,
+        req.headers['user-agent']
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    res.status(201).json({
+      status: 201,
+      message: 'Property created successfully',
+      data: newProperty
+    });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Property creation error:', error);
+    
+    res.status(500).json({
+      status: 500,
+      message: 'Failed to create property',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  } finally {
+    client.release();
+  }
+});
+
 // Get all properties with summary statistics
 router.get('/', authenticateTokenSimple, async (req, res) => {
   const client = await pool.connect();
@@ -202,7 +356,7 @@ router.get('/', authenticateTokenSimple, async (req, res) => {
   }
 });
 
-// Get single property by ID with detailed information
+// Get single property by ID with detailed information - MOVED AFTER GET /
 router.get('/:id', authenticateTokenSimple, authorizeRole(['Super Admin', 'Admin', 'Manager', 'Staff']), async (req, res) => {
   const client = await pool.connect();
   
@@ -276,135 +430,6 @@ router.get('/:id', authenticateTokenSimple, authorizeRole(['Super Admin', 'Admin
     res.status(500).json({
       status: 500,
       message: 'Failed to fetch property',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  } finally {
-    client.release();
-  }
-});
-
-// Create new property
-router.post('/properties', authenticateTokenSimple, authorizeRole(['Super Admin', 'Admin', 'Manager']), async (req, res) => {
-  const client = await pool.connect();
-  
-  try {
-    await client.query('BEGIN');
-
-    const {
-      propertyName,
-      address,
-      propertyType,
-      totalUnits = 1,
-      sizeSquareFt,
-      monthlyRent,
-      securityDeposit,
-      description,
-      amenities = [],
-      units = []
-    } = req.body;
-
-    // Validate required fields
-    if (!propertyName || !address || !propertyType) {
-      return res.status(400).json({
-        status: 400,
-        message: 'Property name, address, and type are required'
-      });
-    }
-
-    // Insert property
-    const propertyQuery = `
-      INSERT INTO properties (
-        property_name, address, property_type, total_units, 
-        size_sq_ft, monthly_rent, security_deposit, description
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      RETURNING *
-    `;
-
-    const propertyResult = await client.query(propertyQuery, [
-      propertyName,
-      address,
-      propertyType,
-      totalUnits,
-      sizeSquareFt,
-      monthlyRent,
-      securityDeposit,
-      description
-    ]);
-
-    const newProperty = propertyResult.rows[0];
-
-    // Add amenities if provided
-    if (amenities && amenities.length > 0) {
-      for (const amenityName of amenities) {
-        // Get or create amenity
-        const amenityResult = await client.query(
-          'INSERT INTO amenities (name) VALUES ($1) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id',
-          [amenityName]
-        );
-        
-        const amenityId = amenityResult.rows[0].id;
-        
-        // Link to property
-        await client.query(
-          'INSERT INTO property_amenities (property_id, amenity_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-          [newProperty.id, amenityId]
-        );
-      }
-    }
-
-    // Add units if provided, otherwise the trigger will create a default unit for single-unit properties
-    if (units && units.length > 0) {
-      for (const unit of units) {
-        await client.query(
-          `INSERT INTO units (
-            property_id, unit_number, bedrooms, bathrooms, 
-            size_sq_ft, monthly_rent, security_deposit, occupancy_status
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-          [
-            newProperty.id,
-            unit.unitNumber || 'Main',
-            unit.bedrooms || 0,
-            unit.bathrooms || 0,
-            unit.sizeSquareFt || sizeSquareFt,
-            unit.monthlyRent || monthlyRent,
-            unit.securityDeposit || securityDeposit,
-            unit.occupancyStatus || 'vacant'
-          ]
-        );
-      }
-    }
-
-    // Log activity
-    await client.query(
-      `INSERT INTO user_activity_log 
-       (user_id, activity_type, activity_description, affected_resource_type, affected_resource_id, ip_address, user_agent)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [
-        req.user.id,
-        'property_created',
-        `Created new property: ${propertyName}`,
-        'property',
-        newProperty.id,
-        req.ip,
-        req.headers['user-agent']
-      ]
-    );
-
-    await client.query('COMMIT');
-
-    res.status(201).json({
-      status: 201,
-      message: 'Property created successfully',
-      data: newProperty
-    });
-
-  } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('Property creation error:', error);
-    
-    res.status(500).json({
-      status: 500,
-      message: 'Failed to create property',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   } finally {
@@ -613,30 +638,59 @@ router.delete('/:id', authenticateTokenSimple, authorizeRole(['Super Admin', 'Ad
     }
   });
 
-// Get available amenities
-router.get('/amenities', authenticateTokenSimple, async (req, res) => {
-  const client = await pool.connect();
+// Get units for a specific property
+router.get('/:propertyId/units', authenticateTokenSimple, async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+      const { propertyId } = req.params;
   
-  try {
-    const result = await client.query('SELECT * FROM amenities ORDER BY name');
-    
-    res.status(200).json({
-      status: 200,
-      message: 'Amenities retrieved successfully',
-      data: result.rows
-    });
-
-  } catch (error) {
-    console.error('Amenities fetch error:', error);
-    
-    res.status(500).json({
-      status: 500,
-      message: 'Failed to fetch amenities'
-    });
-  } finally {
-    client.release();
-  }
-});
+      const unitsQuery = `
+        SELECT 
+          u.*,
+          CASE 
+            WHEN l.id IS NOT NULL AND l.lease_status = 'active' THEN 
+              JSON_BUILD_OBJECT(
+                'lease_id', l.id,
+                'lease_number', l.lease_number,
+                'tenant_names', (
+                  SELECT STRING_AGG(t.first_name || ' ' || t.last_name, ', ')
+                  FROM lease_tenants lt
+                  JOIN tenants t ON lt.tenant_id = t.id
+                  WHERE lt.lease_id = l.id AND lt.removed_date IS NULL
+                ),
+                'start_date', l.start_date,
+                'end_date', l.end_date,
+                'monthly_rent', l.monthly_rent
+              )
+            ELSE NULL
+          END as current_lease
+        FROM units u
+        LEFT JOIN leases l ON u.id = l.unit_id AND l.lease_status = 'active'
+        WHERE u.property_id = $1
+        ORDER BY u.unit_number
+      `;
+  
+      const result = await client.query(unitsQuery, [propertyId]);
+  
+      res.status(200).json({
+        status: 200,
+        message: 'Units retrieved successfully',
+        data: result.rows
+      });
+  
+    } catch (error) {
+      console.error('Units fetch error:', error);
+      
+      res.status(500).json({
+        status: 500,
+        message: 'Failed to fetch units',
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      });
+    } finally {
+      client.release();
+    }
+  });
 
 // Update specific unit within a property
 router.put('/:propertyId/units/:unitId', authenticateTokenSimple, async (req, res) => {
@@ -749,60 +803,6 @@ router.put('/:propertyId/units/:unitId', authenticateTokenSimple, async (req, re
       res.status(500).json({
         status: 500,
         message: 'Failed to update unit',
-        error: process.env.NODE_ENV === 'development' ? error.message : undefined
-      });
-    } finally {
-      client.release();
-    }
-  });
-  
-  // Get units for a specific property
-  router.get('/:propertyId/units', authenticateTokenSimple, async (req, res) => {
-    const client = await pool.connect();
-    
-    try {
-      const { propertyId } = req.params;
-  
-      const unitsQuery = `
-        SELECT 
-          u.*,
-          CASE 
-            WHEN l.id IS NOT NULL AND l.lease_status = 'active' THEN 
-              JSON_BUILD_OBJECT(
-                'lease_id', l.id,
-                'lease_number', l.lease_number,
-                'tenant_names', (
-                  SELECT STRING_AGG(t.first_name || ' ' || t.last_name, ', ')
-                  FROM lease_tenants lt
-                  JOIN tenants t ON lt.tenant_id = t.id
-                  WHERE lt.lease_id = l.id AND lt.removed_date IS NULL
-                ),
-                'start_date', l.start_date,
-                'end_date', l.end_date,
-                'monthly_rent', l.monthly_rent
-              )
-            ELSE NULL
-          END as current_lease
-        FROM units u
-        LEFT JOIN leases l ON u.id = l.unit_id AND l.lease_status = 'active'
-        WHERE u.property_id = $1
-        ORDER BY u.unit_number
-      `;
-  
-      const result = await client.query(unitsQuery, [propertyId]);
-  
-      res.status(200).json({
-        status: 200,
-        message: 'Units retrieved successfully',
-        data: result.rows
-      });
-  
-    } catch (error) {
-      console.error('Units fetch error:', error);
-      
-      res.status(500).json({
-        status: 500,
-        message: 'Failed to fetch units',
         error: process.env.NODE_ENV === 'development' ? error.message : undefined
       });
     } finally {
