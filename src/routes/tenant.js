@@ -8,6 +8,48 @@ import {
 
 const router = express.Router();
 
+/**
+ * Safely converts a value to a number, returning null for empty/invalid values
+ */
+const safeParseFloat = (value) => {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  const parsed = parseFloat(value);
+  return isNaN(parsed) ? null : parsed;
+};
+
+/**
+ * Safely converts a value to an integer, returning null for empty/invalid values
+ */
+const safeParseInt = (value) => {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  const parsed = parseInt(value);
+  return isNaN(parsed) ? null : parsed;
+};
+
+/**
+ * Safely processes a string value, returning null for empty strings
+ */
+const safeString = (value) => {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  return typeof value === 'string' ? value.trim() : String(value).trim();
+};
+
+/**
+ * Safely processes a date string, returning null for empty values
+ */
+const safeDate = (value) => {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  return typeof value === 'string' ? value.trim() : value;
+};
+
 router.get(
   "/blacklist-categories",
   authenticateTokenSimple,
@@ -754,12 +796,55 @@ router.post(
 );
 
 // Enhanced tenant creation route with unit allocation
+// Enhanced tenant creation route with unit allocation
 router.post("/onboard-with-unit", authenticateTokenSimple, async (req, res) => {
   const client = await pool.connect();
 
   try {
     await client.query("BEGIN");
 
+    // MOVE variable declarations to the beginning, BEFORE blacklist check
+    const {
+      // Tenant information
+      firstName,
+      lastName,
+      email,
+      phone,
+      alternatePhone,
+      dateOfBirth,
+      identificationType,
+      identificationNumber,
+      emergencyContactName,
+      emergencyContactPhone,
+      emergencyContactRelationship,
+      employmentStatus,
+      employerName,
+      monthlyIncome,
+      previousAddress,
+
+      // Unit and lease information
+      selectedUnitId,
+      leaseStart,
+      leaseEnd,
+      leaseType = "Fixed Term",
+      customMonthlyRent, // Optional: override unit's default rent
+      customSecurityDeposit, // Optional: override unit's default deposit
+      petDeposit = 0,
+      lateFee = 0,
+      gracePeriodDays = 5,
+      rentDueDay = 1,
+      leaseTerms,
+      specialConditions,
+      moveInDate,
+
+      // Co-tenants (optional)
+      coTenants = [], // Array of additional tenant information
+
+      // Reservation ID (if unit was previously reserved)
+      reservationId,
+    } = req.body;
+
+    // NOW perform blacklist check AFTER variables are declared
     const blacklistCheck = await client.query(
       `SELECT 
         id, first_name, last_name, is_blacklisted, blacklist_reason, blacklist_severity
@@ -804,46 +889,6 @@ router.post("/onboard-with-unit", authenticateTokenSimple, async (req, res) => {
         },
       });
     }
-
-    const {
-      // Tenant information
-      firstName,
-      lastName,
-      email,
-      phone,
-      alternatePhone,
-      dateOfBirth,
-      identificationType,
-      identificationNumber,
-      emergencyContactName,
-      emergencyContactPhone,
-      emergencyContactRelationship,
-      employmentStatus,
-      employerName,
-      monthlyIncome,
-      previousAddress,
-
-      // Unit and lease information
-      selectedUnitId,
-      leaseStart,
-      leaseEnd,
-      leaseType = "Fixed Term",
-      customMonthlyRent, // Optional: override unit's default rent
-      customSecurityDeposit, // Optional: override unit's default deposit
-      petDeposit = 0,
-      lateFee = 0,
-      gracePeriodDays = 5,
-      rentDueDay = 1,
-      leaseTerms,
-      specialConditions,
-      moveInDate,
-
-      // Co-tenants (optional)
-      coTenants = [], // Array of additional tenant information
-
-      // Reservation ID (if unit was previously reserved)
-      reservationId,
-    } = req.body;
 
     // Validate required fields
     if (!firstName || !lastName || !email || !selectedUnitId || !leaseStart) {
@@ -927,30 +972,60 @@ router.post("/onboard-with-unit", authenticateTokenSimple, async (req, res) => {
         RETURNING *
       `;
 
+    // Handle empty strings for numeric and date fields
+    const processedMonthlyIncome = monthlyIncome && monthlyIncome.toString().trim() !== '' 
+      ? parseFloat(monthlyIncome) 
+      : null;
+    
+    const processedDateOfBirth = dateOfBirth && dateOfBirth.trim() !== '' 
+      ? dateOfBirth 
+      : null;
+
     const tenantResult = await client.query(tenantQuery, [
       firstName,
       lastName,
       email,
       phone,
-      alternatePhone,
-      dateOfBirth,
-      identificationType,
-      identificationNumber,
-      emergencyContactName,
-      emergencyContactPhone,
-      emergencyContactRelationship,
-      employmentStatus,
-      employerName,
-      monthlyIncome,
-      previousAddress,
+      alternatePhone || null,
+      processedDateOfBirth,
+      identificationType || null,
+      identificationNumber || null,
+      emergencyContactName || null,
+      emergencyContactPhone || null,
+      emergencyContactRelationship || null,
+      employmentStatus || null,
+      employerName || null,
+      processedMonthlyIncome,
+      previousAddress || null,
     ]);
 
     const primaryTenant = tenantResult.rows[0];
 
     // Determine lease amounts (use custom amounts if provided, otherwise use unit defaults)
-    const finalMonthlyRent = customMonthlyRent || selectedUnit.monthly_rent;
-    const finalSecurityDeposit =
-      customSecurityDeposit || selectedUnit.security_deposit;
+    const finalMonthlyRent = customMonthlyRent && customMonthlyRent.toString().trim() !== '' 
+      ? parseFloat(customMonthlyRent) 
+      : parseFloat(selectedUnit.monthly_rent);
+      
+    const finalSecurityDeposit = customSecurityDeposit && customSecurityDeposit.toString().trim() !== ''
+      ? parseFloat(customSecurityDeposit) 
+      : parseFloat(selectedUnit.security_deposit);
+
+    // Process other numeric fields
+    const processedPetDeposit = petDeposit && petDeposit.toString().trim() !== '' 
+      ? parseFloat(petDeposit) 
+      : 0;
+      
+    const processedLateFee = lateFee && lateFee.toString().trim() !== '' 
+      ? parseFloat(lateFee) 
+      : 0;
+      
+    const processedGracePeriodDays = gracePeriodDays && gracePeriodDays.toString().trim() !== '' 
+      ? parseInt(gracePeriodDays) 
+      : 5;
+      
+    const processedRentDueDay = rentDueDay && rentDueDay.toString().trim() !== '' 
+      ? parseInt(rentDueDay) 
+      : 1;
 
     // Create or update lease
     let leaseId;
@@ -983,10 +1058,10 @@ router.post("/onboard-with-unit", authenticateTokenSimple, async (req, res) => {
         leaseEnd,
         finalMonthlyRent,
         finalSecurityDeposit,
-        petDeposit,
-        lateFee,
-        gracePeriodDays,
-        rentDueDay,
+        processedPetDeposit,
+        processedLateFee,
+        processedGracePeriodDays,
+        processedRentDueDay,
         leaseTerms,
         specialConditions,
         moveInDate,
@@ -1013,10 +1088,10 @@ router.post("/onboard-with-unit", authenticateTokenSimple, async (req, res) => {
         leaseEnd,
         finalMonthlyRent,
         finalSecurityDeposit,
-        petDeposit,
-        lateFee,
-        gracePeriodDays,
-        rentDueDay,
+        processedPetDeposit,
+        processedLateFee,
+        processedGracePeriodDays,
+        processedRentDueDay,
         leaseTerms,
         specialConditions,
         new Date(),
@@ -1046,23 +1121,32 @@ router.post("/onboard-with-unit", authenticateTokenSimple, async (req, res) => {
         // Use existing tenant
         coTenantId = coTenantEmailCheck.rows[0].id;
       } else {
+        // Process co-tenant data same way as primary tenant
+        const coTenantProcessedMonthlyIncome = coTenant.monthlyIncome && coTenant.monthlyIncome.toString().trim() !== '' 
+          ? parseFloat(coTenant.monthlyIncome) 
+          : null;
+        
+        const coTenantProcessedDateOfBirth = coTenant.dateOfBirth && coTenant.dateOfBirth.trim() !== '' 
+          ? coTenant.dateOfBirth 
+          : null;
+
         // Create new co-tenant
         const coTenantResult = await client.query(tenantQuery, [
           coTenant.firstName,
           coTenant.lastName,
           coTenant.email,
           coTenant.phone,
-          coTenant.alternatePhone,
-          coTenant.dateOfBirth,
-          coTenant.identificationType,
-          coTenant.identificationNumber,
-          coTenant.emergencyContactName,
-          coTenant.emergencyContactPhone,
-          coTenant.emergencyContactRelationship,
-          coTenant.employmentStatus,
-          coTenant.employerName,
-          coTenant.monthlyIncome,
-          coTenant.previousAddress,
+          coTenant.alternatePhone || null,
+          coTenantProcessedDateOfBirth,
+          coTenant.identificationType || null,
+          coTenant.identificationNumber || null,
+          coTenant.emergencyContactName || null,
+          coTenant.emergencyContactPhone || null,
+          coTenant.emergencyContactRelationship || null,
+          coTenant.employmentStatus || null,
+          coTenant.employerName || null,
+          coTenantProcessedMonthlyIncome,
+          coTenant.previousAddress || null,
         ]);
         coTenantId = coTenantResult.rows[0].id;
       }
@@ -1778,7 +1862,16 @@ router.put("/:id", authenticateTokenSimple, async (req, res) => {
       });
     }
 
-    // Update tenant
+    // Handle empty strings for numeric and date fields - SAME AS ONBOARDING
+    const processedMonthlyIncome = monthlyIncome && monthlyIncome.toString().trim() !== '' 
+      ? parseFloat(monthlyIncome) 
+      : null;
+    
+    const processedDateOfBirth = dateOfBirth && dateOfBirth.trim() !== '' 
+      ? dateOfBirth 
+      : null;
+
+    // Update tenant with processed data
     const updateQuery = `
         UPDATE tenants SET 
           first_name = $1,
@@ -1806,17 +1899,17 @@ router.put("/:id", authenticateTokenSimple, async (req, res) => {
       lastName,
       email,
       phone,
-      alternatePhone,
-      dateOfBirth,
-      identificationType,
-      identificationNumber,
-      emergencyContactName,
-      emergencyContactPhone,
-      emergencyContactRelationship,
-      employmentStatus,
-      employerName,
-      monthlyIncome,
-      previousAddress,
+      alternatePhone || null,           // Handle empty strings
+      processedDateOfBirth,             // Processed date
+      identificationType || null,       // Handle empty strings
+      identificationNumber || null,     // Handle empty strings
+      emergencyContactName || null,     // Handle empty strings
+      emergencyContactPhone || null,    // Handle empty strings
+      emergencyContactRelationship || null, // Handle empty strings
+      employmentStatus || null,         // Handle empty strings
+      employerName || null,             // Handle empty strings
+      processedMonthlyIncome,           // Processed numeric value
+      previousAddress || null,          // Handle empty strings
       tenantId,
     ]);
 

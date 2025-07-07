@@ -590,14 +590,18 @@ router.get('/:id/download', authenticateTokenSimple, async (req, res) => {
   
   try {
     const documentId = req.params.id;
+    console.log("📥 Downloading document ID:", documentId);
     
     const result = await client.query(`
-      SELECT file_path, original_filename, mime_type, document_name
+      SELECT file_path, original_filename, mime_type, document_name, file_size
       FROM documents 
       WHERE id = $1 AND document_status = 'active'
     `, [documentId]);
 
+    console.log("📄 Document query result:", result.rows);
+    
     if (result.rows.length === 0) {
+      console.log("❌ Document not found in database");
       return res.status(404).json({
         status: 404,
         message: 'Document not found'
@@ -605,41 +609,165 @@ router.get('/:id/download', authenticateTokenSimple, async (req, res) => {
     }
 
     const document = result.rows[0];
+    console.log("📁 Checking file path:", document.file_path);
     
     // Check if file exists
     try {
       await fs.access(document.file_path);
+      console.log("✅ File exists on server");
     } catch (error) {
+      console.log("❌ File not found on server:", error.message);
       return res.status(404).json({
         status: 404,
-        message: 'File not found on server'
+        message: 'File not found on server',
+        filePath: document.file_path
       });
     }
 
-    // Log access
-    await logDocumentAccess(
-      client, 
-      documentId, 
-      req.user.username || req.user.id, 
-      'download',
-      req.ip,
-      req.get('User-Agent')
-    );
+    // Log access (but don't let it fail the download)
+    try {
+      await logDocumentAccess(
+        client, 
+        documentId, 
+        req.user.username || req.user.id, 
+        'download',
+        req.ip,
+        req.get('User-Agent')
+      );
+      console.log("✅ Document access logged");
+    } catch (logError) {
+      console.warn("⚠️ Failed to log document access:", logError.message);
+      // Continue with download even if logging fails
+    }
 
-    // Set appropriate headers
+    // Set appropriate headers for download
     res.setHeader('Content-Disposition', `attachment; filename="${document.original_filename}"`);
     res.setHeader('Content-Type', document.mime_type);
+    
+    // Set content length if available
+    if (document.file_size) {
+      res.setHeader('Content-Length', document.file_size);
+    }
 
-    // Stream the file
-    const fileStream = await fs.readFile(document.file_path);
-    res.send(fileStream);
+    console.log("📤 Starting file stream...");
+    
+    // Stream the file using createReadStream for better performance
+    const path = await import('path');
+    const { createReadStream } = await import('fs');
+    
+    try {
+      const fileStream = createReadStream(document.file_path);
+      
+      fileStream.on('error', (streamError) => {
+        console.error("❌ File stream error:", streamError);
+        if (!res.headersSent) {
+          res.status(500).json({
+            status: 500,
+            message: 'Error reading file',
+            error: streamError.message
+          });
+        }
+      });
+
+      fileStream.on('end', () => {
+        console.log("✅ File download completed");
+      });
+
+      // Pipe the file to the response
+      fileStream.pipe(res);
+      
+    } catch (streamError) {
+      console.error("❌ Error creating file stream:", streamError);
+      if (!res.headersSent) {
+        res.status(500).json({
+          status: 500,
+          message: 'Error streaming file',
+          error: streamError.message
+        });
+      }
+    }
 
   } catch (error) {
     console.error('❌ Document download error:', error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        status: 500,
+        message: 'Failed to download document',
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      });
+    }
+  } finally {
+    client.release();
+  }
+});
+
+// Add this debug route to your backend to check file status
+router.get('/:id/check', authenticateTokenSimple, async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    const documentId = req.params.id;
+    console.log("🔍 Checking document ID:", documentId);
+    
+    const result = await client.query(`
+      SELECT file_path, original_filename, mime_type, document_name, file_size
+      FROM documents 
+      WHERE id = $1 AND document_status = 'active'
+    `, [documentId]);
+
+    if (result.rows.length === 0) {
+      return res.json({
+        status: 'not_found',
+        message: 'Document not found in database'
+      });
+    }
+
+    const document = result.rows[0];
+    
+    // Check if file exists
+    let fileExists = false;
+    let fileStats = null;
+    let error = null;
+    
+    try {
+      await fs.access(document.file_path);
+      fileExists = true;
+      
+      // Get file stats
+      const stats = await fs.stat(document.file_path);
+      fileStats = {
+        size: stats.size,
+        created: stats.birthtime,
+        modified: stats.mtime,
+        isFile: stats.isFile()
+      };
+    } catch (fsError) {
+      error = fsError.message;
+    }
+
+    res.json({
+      status: 'success',
+      document: {
+        id: documentId,
+        name: document.document_name,
+        original_filename: document.original_filename,
+        file_path: document.file_path,
+        mime_type: document.mime_type,
+        db_file_size: document.file_size
+      },
+      file_check: {
+        exists: fileExists,
+        stats: fileStats,
+        error: error
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ File check error:', error);
     res.status(500).json({
-      status: 500,
-      message: 'Failed to download document',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      status: 'error',
+      message: 'Failed to check file',
+      error: error.message
     });
   } finally {
     client.release();
