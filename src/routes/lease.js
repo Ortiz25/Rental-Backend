@@ -5,6 +5,7 @@ import { authenticateToken, authorizeRole, authenticateTokenSimple } from '../mi
 const router = express.Router();
 
 // Get all leases with property and tenant information
+
 router.get('/', authenticateTokenSimple, async (req, res) => {
   try {
     const { status, search, page = 1, limit = 10 } = req.query;
@@ -56,52 +57,38 @@ router.get('/', authenticateTokenSimple, async (req, res) => {
         
         -- All tenants
         STRING_AGG(t.first_name || ' ' || t.last_name, ', ' ORDER BY lt.is_primary_tenant DESC) as all_tenant_names,
-        
-        -- Lease financial summary
-        COALESCE(rps.total_paid, 0) as total_payments_received,
-        COALESCE(rps.total_overdue, 0) as total_overdue_amount,
-        COALESCE(rps.last_payment_date, null) as last_payment_date
+        STRING_AGG(t.email, ', ' ORDER BY lt.is_primary_tenant DESC) as all_tenant_emails
         
       FROM leases l
       JOIN units u ON l.unit_id = u.id
       JOIN properties p ON u.property_id = p.id
       LEFT JOIN lease_tenants lt ON l.id = lt.lease_id AND lt.removed_date IS NULL
       LEFT JOIN tenants t ON lt.tenant_id = t.id
-      LEFT JOIN (
-        SELECT 
-          lease_id,
-          SUM(CASE WHEN payment_status = 'paid' THEN amount_paid ELSE 0 END) as total_paid,
-          SUM(CASE WHEN payment_status = 'overdue' THEN amount_due ELSE 0 END) as total_overdue,
-          MAX(CASE WHEN payment_status = 'paid' THEN payment_date ELSE NULL END) as last_payment_date
-        FROM rent_payments 
-        GROUP BY lease_id
-      ) rps ON l.id = rps.lease_id
     `;
     
     let whereConditions = [];
     let queryParams = [];
-    let countParams = []; // Separate parameters for count query
     let paramIndex = 1;
     
     // Add status filter
     if (status) {
       whereConditions.push(`l.lease_status = $${paramIndex}`);
       queryParams.push(status);
-      countParams.push(status);
       paramIndex++;
     }
     
-    // Add search filter
+    // IMPROVED: Add search filter with better tenant matching
     if (search) {
       whereConditions.push(`(
         p.property_name ILIKE $${paramIndex} OR 
         u.unit_number ILIKE $${paramIndex} OR 
         l.lease_number ILIKE $${paramIndex} OR
         t.first_name ILIKE $${paramIndex} OR 
-        t.last_name ILIKE $${paramIndex}
+        t.last_name ILIKE $${paramIndex} OR
+        t.email ILIKE $${paramIndex} OR
+        (t.first_name || ' ' || t.last_name) ILIKE $${paramIndex}
       )`);
       queryParams.push(`%${search}%`);
-      countParams.push(`%${search}%`);
       paramIndex++;
     }
     
@@ -111,8 +98,7 @@ router.get('/', authenticateTokenSimple, async (req, res) => {
     
     query += `
       GROUP BY l.id, p.property_name, p.address, p.property_type, 
-               u.unit_number, u.bedrooms, u.bathrooms, u.size_sq_ft,
-               rps.total_paid, rps.total_overdue, rps.last_payment_date
+               u.unit_number, u.bedrooms, u.bathrooms, u.size_sq_ft
       ORDER BY l.created_at DESC
     `;
     
@@ -124,29 +110,13 @@ router.get('/', authenticateTokenSimple, async (req, res) => {
     // Execute main query
     const result = await pool.query(query, queryParams);
     
-    // Get total count for pagination (using separate count query)
-    let countQuery = `
-      SELECT COUNT(DISTINCT l.id) as total
-      FROM leases l
-      JOIN units u ON l.unit_id = u.id
-      JOIN properties p ON u.property_id = p.id
-      LEFT JOIN lease_tenants lt ON l.id = lt.lease_id AND lt.removed_date IS NULL
-      LEFT JOIN tenants t ON lt.tenant_id = t.id
-    `;
-    
-    // Add the same WHERE conditions to count query
-    countQuery += whereClause;
-    
-    const countResult = await pool.query(countQuery, countParams);
-    const totalCount = parseInt(countResult.rows[0].total);
-    
     res.json({
       success: true,
       data: result.rows,
       pagination: {
         currentPage: parseInt(page),
-        totalPages: Math.ceil(totalCount / limit),
-        totalCount,
+        totalPages: Math.ceil(result.rows.length / limit),
+        totalCount: result.rows.length,
         limit: parseInt(limit)
       }
     });
