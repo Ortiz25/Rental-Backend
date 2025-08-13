@@ -1,6 +1,6 @@
 import dotenv from 'dotenv';
 import app from './app.js';
-//import "./src/middleware/cronjobs.js"
+import "./src/middleware/cronjobs.js"
 
 dotenv.config();
 
