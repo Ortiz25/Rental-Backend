@@ -98,27 +98,80 @@ router.post('/', authenticateTokenSimple, authorizeRole(['Super Admin', 'Admin',
       }
     }
 
-    // Add units if provided, otherwise the trigger will create a default unit for single-unit properties
+    // FIXED: Handle unit creation logic properly
     if (units && units.length > 0) {
-      for (const unit of units) {
-        await client.query(
-          `INSERT INTO units (
-            property_id, unit_number, bedrooms, bathrooms, 
-            size_sq_ft, monthly_rent, security_deposit, occupancy_status
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-          [
-            newProperty.id,
-            unit.unitNumber || 'Main',
-            unit.bedrooms || 0,
-            unit.bathrooms || 0,
-            unit.sizeSquareFt || sizeSquareFt,
-            unit.monthlyRent || monthlyRent,
-            unit.securityDeposit || securityDeposit,
-            unit.occupancyStatus || 'vacant'
-          ]
-        );
+      // For properties with explicit units, we need to handle the trigger-created unit
+      if (propertyType !== 'Apartment' && totalUnits === 1) {
+        // The trigger already created a "Main" unit, so we should update it instead of inserting
+        const unit = units[0]; // Assuming single unit for non-apartment properties
+        
+        if (unit.unitNumber === 'Main' || !unit.unitNumber) {
+          // Update the trigger-created unit
+          await client.query(
+            `UPDATE units SET 
+              bedrooms = $1, 
+              bathrooms = $2, 
+              size_sq_ft = $3, 
+              monthly_rent = $4, 
+              security_deposit = $5, 
+              occupancy_status = $6,
+              updated_at = CURRENT_TIMESTAMP
+            WHERE property_id = $7 AND unit_number = 'Main'`,
+            [
+              unit.bedrooms || 0,
+              unit.bathrooms || 0,
+              unit.sizeSquareFt || sizeSquareFt,
+              unit.monthlyRent || monthlyRent,
+              unit.securityDeposit || securityDeposit,
+              unit.occupancyStatus || 'vacant',
+              newProperty.id
+            ]
+          );
+        } else {
+          // Delete the trigger-created unit and insert the custom one
+          await client.query('DELETE FROM units WHERE property_id = $1 AND unit_number = $2', [newProperty.id, 'Main']);
+          
+          await client.query(
+            `INSERT INTO units (
+              property_id, unit_number, bedrooms, bathrooms, 
+              size_sq_ft, monthly_rent, security_deposit, occupancy_status
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            [
+              newProperty.id,
+              unit.unitNumber,
+              unit.bedrooms || 0,
+              unit.bathrooms || 0,
+              unit.sizeSquareFt || sizeSquareFt,
+              unit.monthlyRent || monthlyRent,
+              unit.securityDeposit || securityDeposit,
+              unit.occupancyStatus || 'vacant'
+            ]
+          );
+        }
+      } else {
+        // For apartments or multi-unit properties, insert all units normally
+        // The trigger won't create a default unit for apartments
+        for (const unit of units) {
+          await client.query(
+            `INSERT INTO units (
+              property_id, unit_number, bedrooms, bathrooms, 
+              size_sq_ft, monthly_rent, security_deposit, occupancy_status
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            [
+              newProperty.id,
+              unit.unitNumber || 'Main',
+              unit.bedrooms || 0,
+              unit.bathrooms || 0,
+              unit.sizeSquareFt || sizeSquareFt,
+              unit.monthlyRent || monthlyRent,
+              unit.securityDeposit || securityDeposit,
+              unit.occupancyStatus || 'vacant'
+            ]
+          );
+        }
       }
     }
+    // If no units provided, the trigger will handle creating the default unit for non-apartments
 
     // Log activity
     await client.query(

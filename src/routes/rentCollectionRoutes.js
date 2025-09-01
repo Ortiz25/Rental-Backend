@@ -68,12 +68,14 @@ router.get('/rent-collection', authenticateTokenSimple, async (req, res) => {
 
     const whereClause = whereConditions.join(' AND ');
 
-    // Enhanced query with verification info
+    // Enhanced query with grace period calculation
     const paymentsQuery = `
       SELECT 
         rp.id,
         rp.lease_id,
-        rp.due_date,
+        rp.due_date as original_due_date,
+        -- Calculate effective due date with grace period
+        (rp.due_date + INTERVAL '1 day' * COALESCE(l.grace_period_days, 5)) as due_date,
         rp.payment_date,
         rp.amount_due,
         rp.amount_paid,
@@ -83,6 +85,8 @@ router.get('/rent-collection', authenticateTokenSimple, async (req, res) => {
         rp.payment_reference,
         rp.notes,
         rp.processed_by,
+        -- Lease grace period info
+        COALESCE(l.grace_period_days, 5) as grace_period_days,
         -- Tenant and property info
         t.first_name || ' ' || t.last_name as tenant_name,
         t.email as tenant_email,
@@ -118,12 +122,17 @@ router.get('/rent-collection', authenticateTokenSimple, async (req, res) => {
           ORDER BY ps.submission_date DESC
           LIMIT 1
         ) as latest_submission,
-        -- Days overdue calculation
+        -- Updated days overdue calculation (using grace period)
         CASE 
           WHEN rp.payment_status = 'overdue' THEN 
-            (CURRENT_DATE - rp.due_date)
+            EXTRACT(DAY FROM (CURRENT_DATE - (rp.due_date + INTERVAL '1 day' * COALESCE(l.grace_period_days, 5))))::INTEGER
           ELSE 0
-        END as days_overdue
+        END as days_overdue,
+        -- Show if payment is within grace period
+        CASE 
+          WHEN rp.payment_status = 'pending' AND CURRENT_DATE > rp.due_date AND CURRENT_DATE <= (rp.due_date + INTERVAL '1 day' * COALESCE(l.grace_period_days, 5)) THEN true
+          ELSE false
+        END as within_grace_period
       FROM rent_payments rp
       JOIN leases l ON rp.lease_id = l.id
       JOIN lease_tenants lt ON l.id = lt.lease_id AND lt.removed_date IS NULL
@@ -166,10 +175,19 @@ router.get('/rent-collection', authenticateTokenSimple, async (req, res) => {
 
     console.log(`✅ Found ${paymentsResult.rows.length} rent payments`);
 
+    // Process results to format dates properly
+    const processedResults = paymentsResult.rows.map(row => ({
+      ...row,
+      due_date: row.due_date, // This now includes grace period
+      original_due_date: row.original_due_date, // Original due date without grace period
+      days_overdue: Math.max(0, row.days_overdue), // Ensure non-negative
+      within_grace_period: row.within_grace_period
+    }));
+
     res.status(200).json({
       status: 200,
       message: 'Rent payments retrieved successfully',
-      data: paymentsResult.rows,
+      data: processedResults,
       pagination: {
         currentPage: parseInt(page),
         totalPages,

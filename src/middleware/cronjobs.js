@@ -24,7 +24,7 @@ import cron from 'node-cron';
 //     }
 // });
 
-// Original schedules (fix syntax)
+
 
 // # 1. GENERATE MONTHLY RENT PAYMENTS - 1st of each month at 2 AM
 // # Creates new rent payment records for all active leases
