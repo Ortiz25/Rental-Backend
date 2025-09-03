@@ -5,14 +5,144 @@ import {
   authorizeRole,
   authenticateTokenSimple,
 } from "../middleware/auth.js";
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs/promises';
+import { fileURLToPath } from 'url';
+
 
 const router = express.Router();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// File storage configuration
+const UPLOAD_BASE_PATH = '/home/files/rms-files';
+
+// Ensure upload directories exist
+const ensureUploadDirectories = async () => {
+  const directories = [
+    `${UPLOAD_BASE_PATH}/documents`,
+    `${UPLOAD_BASE_PATH}/documents/lease-agreements`,
+    `${UPLOAD_BASE_PATH}/documents/insurance`,
+    `${UPLOAD_BASE_PATH}/documents/maintenance`,
+    `${UPLOAD_BASE_PATH}/documents/financial`,
+    `${UPLOAD_BASE_PATH}/documents/legal`,
+    `${UPLOAD_BASE_PATH}/documents/tenant-documents`,
+    `${UPLOAD_BASE_PATH}/documents/property-documents`,
+    `${UPLOAD_BASE_PATH}/temp`
+  ];
+
+  for (const dir of directories) {
+    try {
+      await fs.mkdir(dir, { recursive: true });
+    } catch (error) {
+      console.error(`Failed to create directory ${dir}:`, error.message);
+    }
+  }
+};
+
+// Initialize directories on startup
+ensureUploadDirectories();
+
+// Configure multer for file uploads
+const storage = multer.diskStorage({
+  destination: async (req, file, cb) => {
+    const category = req.body.category || 'general';
+    const categoryPath = category.toLowerCase().replace(/\s+/g, '-');
+    const uploadPath = `${UPLOAD_BASE_PATH}/documents/${categoryPath}`;
+    
+    try {
+      await fs.mkdir(uploadPath, { recursive: true });
+      cb(null, uploadPath);
+    } catch (error) {
+      console.error('Upload directory creation failed:', error);
+      cb(null, `${UPLOAD_BASE_PATH}/documents`);
+    }
+  },
+  filename: (req, file, cb) => {
+    const timestamp = Date.now();
+    const randomSuffix = Math.round(Math.random() * 1E9);
+    const extension = path.extname(file.originalname);
+    const baseName = path.basename(file.originalname, extension)
+      .replace(/[^a-zA-Z0-9.-]/g, '_')
+      .substring(0, 50);
+    
+    const filename = `${timestamp}_${randomSuffix}_${baseName}${extension}`;
+    cb(null, filename);
+  }
+});
+
+// File filter for allowed types
+const fileFilter = (req, file, cb) => {
+  const allowedTypes = [
+    'application/pdf',
+    'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.ms-excel',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'image/jpeg',
+    'image/png',
+    'image/gif',
+    'text/plain',
+    'text/csv'
+  ];
+
+  if (allowedTypes.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error(`File type ${file.mimetype} is not allowed`), false);
+  }
+};
+
+const upload = multer({
+  storage,
+  fileFilter,
+  limits: {
+    fileSize: 50 * 1024 * 1024, // 50MB limit
+    files: 5 // Maximum 5 files per upload
+  }
+});
+
+// Helper function to get file extension from mime type
+const getFileExtension = (mimetype) => {
+  const mimeToExt = {
+    'application/pdf': 'pdf',
+    'application/msword': 'doc',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+    'application/vnd.ms-excel': 'xls',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/gif': 'gif',
+    'text/plain': 'txt',
+    'text/csv': 'csv'
+  };
+  return mimeToExt[mimetype] || 'unknown';
+};
+
+// Helper function to log document access
+const logDocumentAccess = async (client, documentId, userId, accessType, ipAddress, userAgent) => {
+  try {
+    await client.query(`
+      INSERT INTO document_access_log (document_id, accessed_by, access_type, ip_address, user_agent)
+      VALUES ($1, $2, $3, $4, $5)
+    `, [documentId, userId, accessType, ipAddress, userAgent]);
+
+    await client.query(`
+      UPDATE documents 
+      SET access_count = access_count + 1, last_accessed = CURRENT_TIMESTAMP 
+      WHERE id = $1
+    `, [documentId]);
+  } catch (error) {
+    console.error('Failed to log document access:', error);
+  }
+};
 
 /**
  * Safely converts a value to a number, returning null for empty/invalid values
  */
 const safeParseFloat = (value) => {
-  if (value === null || value === undefined || value === '') {
+  if (value === null || value === undefined || value === "") {
     return null;
   }
   const parsed = parseFloat(value);
@@ -23,7 +153,7 @@ const safeParseFloat = (value) => {
  * Safely converts a value to an integer, returning null for empty/invalid values
  */
 const safeParseInt = (value) => {
-  if (value === null || value === undefined || value === '') {
+  if (value === null || value === undefined || value === "") {
     return null;
   }
   const parsed = parseInt(value);
@@ -34,20 +164,20 @@ const safeParseInt = (value) => {
  * Safely processes a string value, returning null for empty strings
  */
 const safeString = (value) => {
-  if (value === null || value === undefined || value === '') {
+  if (value === null || value === undefined || value === "") {
     return null;
   }
-  return typeof value === 'string' ? value.trim() : String(value).trim();
+  return typeof value === "string" ? value.trim() : String(value).trim();
 };
 
 /**
  * Safely processes a date string, returning null for empty values
  */
 const safeDate = (value) => {
-  if (value === null || value === undefined || value === '') {
+  if (value === null || value === undefined || value === "") {
     return null;
   }
-  return typeof value === 'string' ? value.trim() : value;
+  return typeof value === "string" ? value.trim() : value;
 };
 
 router.get(
@@ -78,7 +208,6 @@ router.get(
     }
   }
 );
-
 
 // Get all blacklisted tenants
 router.get("/blacklisted/list", authenticateTokenSimple, async (req, res) => {
@@ -165,12 +294,15 @@ router.get("/blacklisted/list", authenticateTokenSimple, async (req, res) => {
     client.release();
   }
 });
-router.get('/blacklist-analytics', authenticateTokenSimple, async (req, res) => {
-  const client = await pool.connect();
-  
-  try {
-    // Get basic stats
-    const statsQuery = `
+router.get(
+  "/blacklist-analytics",
+  authenticateTokenSimple,
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      // Get basic stats
+      const statsQuery = `
       SELECT 
         COUNT(*) as total_blacklisted,
         COUNT(CASE WHEN blacklisted_date > CURRENT_DATE - INTERVAL '30 days' THEN 1 END) as recent_blacklists,
@@ -182,11 +314,11 @@ router.get('/blacklist-analytics', authenticateTokenSimple, async (req, res) => 
       WHERE is_blacklisted = true
     `;
 
-    const statsResult = await client.query(statsQuery);
-    const stats = statsResult.rows[0];
+      const statsResult = await client.query(statsQuery);
+      const stats = statsResult.rows[0];
 
-    // Get common reasons
-    const reasonsQuery = `
+      // Get common reasons
+      const reasonsQuery = `
       SELECT 
         blacklist_reason as reason,
         COUNT(*) as count
@@ -197,10 +329,10 @@ router.get('/blacklist-analytics', authenticateTokenSimple, async (req, res) => 
       LIMIT 10
     `;
 
-    const reasonsResult = await client.query(reasonsQuery);
+      const reasonsResult = await client.query(reasonsQuery);
 
-    // Get monthly trends (last 12 months)
-    const trendsQuery = `
+      // Get monthly trends (last 12 months)
+      const trendsQuery = `
       SELECT 
         TO_CHAR(blacklisted_date, 'YYYY-MM') as month,
         COUNT(*) as count
@@ -211,58 +343,181 @@ router.get('/blacklist-analytics', authenticateTokenSimple, async (req, res) => 
       ORDER BY month
     `;
 
-    const trendsResult = await client.query(trendsQuery);
+      const trendsResult = await client.query(trendsQuery);
 
-    // Get prevented applications count
-    const preventedQuery = `
+      // Get prevented applications count
+      const preventedQuery = `
       SELECT COUNT(*) as prevented
       FROM user_activity_log 
       WHERE activity_type = 'blacklisted_application_blocked'
         AND activity_timestamp > CURRENT_DATE - INTERVAL '30 days'
     `;
 
-    const preventedResult = await client.query(preventedQuery);
+      const preventedResult = await client.query(preventedQuery);
 
-    // Format response
-    const analyticsData = {
-      totalBlacklisted: parseInt(stats.total_blacklisted),
-      recentBlacklists: parseInt(stats.recent_blacklists),
-      preventedApplications: parseInt(preventedResult.rows[0].prevented),
-      
-      severityBreakdown: {
-        low: parseInt(stats.low_severity),
-        medium: parseInt(stats.medium_severity),
-        high: parseInt(stats.high_severity),
-        severe: parseInt(stats.severe_cases)
-      },
-      
-      commonReasons: reasonsResult.rows,
-      
-      monthlyTrends: trendsResult.rows.map(row => ({
-        month: row.month,
-        count: parseInt(row.count)
-      }))
-    };
+      // Format response
+      const analyticsData = {
+        totalBlacklisted: parseInt(stats.total_blacklisted),
+        recentBlacklists: parseInt(stats.recent_blacklists),
+        preventedApplications: parseInt(preventedResult.rows[0].prevented),
 
-    res.status(200).json({
-      status: 200,
-      message: 'Blacklist analytics retrieved successfully',
-      data: analyticsData
+        severityBreakdown: {
+          low: parseInt(stats.low_severity),
+          medium: parseInt(stats.medium_severity),
+          high: parseInt(stats.high_severity),
+          severe: parseInt(stats.severe_cases),
+        },
+
+        commonReasons: reasonsResult.rows,
+
+        monthlyTrends: trendsResult.rows.map((row) => ({
+          month: row.month,
+          count: parseInt(row.count),
+        })),
+      };
+
+      res.status(200).json({
+        status: 200,
+        message: "Blacklist analytics retrieved successfully",
+        data: analyticsData,
+      });
+    } catch (error) {
+      console.error("Blacklist analytics error:", error);
+
+      res.status(500).json({
+        status: 500,
+        message: "Failed to fetch blacklist analytics",
+        error:
+          process.env.NODE_ENV === "development" ? error.message : undefined,
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// POST /api/documents/tenant/upload - Upload tenant-specific document
+router.post('/tenant/upload', authenticateTokenSimple, upload.array('files', 5), async (req, res) => {
+  console.log('📤 Tenant document upload initiated by user:', req.user?.id);
+  
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+
+    const {
+      document_name,
+      category, // This will be document_type for tenant_documents
+      description,
+      tenant_id
+    } = req.body;
+
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({
+        status: 400,
+        message: 'No files uploaded'
+      });
+    }
+
+    if (!tenant_id) {
+      return res.status(400).json({
+        status: 400,
+        message: 'Tenant ID is required'
+      });
+    }
+
+    const uploadedDocuments = [];
+
+    for (const file of req.files) {
+      // Insert into tenant_documents table
+      const documentResult = await client.query(`
+        INSERT INTO tenant_documents (
+          tenant_id,
+          document_type,
+          document_name,
+          file_path,
+          file_size,
+          mime_type,
+          uploaded_by
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id, document_name, file_size, upload_date
+      `, [
+        tenant_id,
+        category,
+        document_name || file.originalname,
+        file.path,
+        file.size,
+        file.mimetype,
+        req.user.username || req.user.id
+      ]);
+
+      const document = documentResult.rows[0];
+      
+      // Also insert into main documents table for unified access
+      await client.query(`
+        INSERT INTO documents (
+          document_name, 
+          original_filename, 
+          file_path, 
+          file_size, 
+          file_type, 
+          mime_type,
+          tenant_id,
+          uploaded_by,
+          tags
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `, [
+        document_name || file.originalname,
+        file.originalname,
+        file.path,
+        file.size,
+        getFileExtension(file.mimetype),
+        file.mimetype,
+        tenant_id,
+        req.user.username || req.user.id,
+        [category, 'tenant-document']
+      ]);
+
+      uploadedDocuments.push({
+        id: document.id,
+        name: document.document_name,
+        size: formatFileSize(document.file_size),
+        uploadedAt: document.upload_date
+      });
+    }
+
+    await client.query('COMMIT');
+
+    res.status(201).json({
+      status: 201,
+      message: `Successfully uploaded ${uploadedDocuments.length} document(s)`,
+      data: { documents: uploadedDocuments }
     });
 
   } catch (error) {
-    console.error('Blacklist analytics error:', error);
+    await client.query('ROLLBACK');
     
+    // Clean up uploaded files on error
+    if (req.files) {
+      for (const file of req.files) {
+        try {
+          await fs.unlink(file.path);
+        } catch (unlinkError) {
+          console.error('Failed to delete uploaded file:', unlinkError);
+        }
+      }
+    }
+
+    console.error('❌ Tenant document upload error:', error);
     res.status(500).json({
       status: 500,
-      message: 'Failed to fetch blacklist analytics',
+      message: 'Failed to upload document(s)',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   } finally {
     client.release();
   }
 });
-
 
 // Get blacklist categories
 
@@ -453,35 +708,33 @@ router.get(
 
       // Get properties with available units
       const propertiesQuery = `
-        SELECT 
-          p.id as property_id,
-          p.property_name,
-          p.address,
-          p.property_type,
-          p.total_units,
-          p.monthly_rent as base_monthly_rent,
-          p.security_deposit as base_security_deposit,
-          
-          -- Count available units
-          COUNT(CASE WHEN u.occupancy_status = 'vacant' THEN 1 END) as available_units,
-          COUNT(u.id) as actual_units,
-          
-          -- Get amenities
-          COALESCE(
-            JSON_AGG(
-              DISTINCT a.name 
-              ORDER BY a.name
-            ) FILTER (WHERE a.name IS NOT NULL), 
-            '[]'::json
-          ) as amenities
-          
-        FROM properties p
-        LEFT JOIN units u ON p.id = u.property_id
-        LEFT JOIN property_amenities pa ON p.id = pa.property_id
-        LEFT JOIN amenities a ON pa.amenity_id = a.id
-        GROUP BY p.id, p.property_name, p.address, p.property_type, p.total_units, p.monthly_rent, p.security_deposit
-        HAVING COUNT(CASE WHEN u.occupancy_status = 'vacant' THEN 1 END) > 0
-        ORDER BY p.property_name
+       SELECT 
+    p.id as property_id, 
+    p.property_name, 
+    p.address, 
+    p.property_type, 
+    p.total_units, 
+    p.monthly_rent as base_monthly_rent, 
+    p.security_deposit as base_security_deposit,
+    
+    -- Count available units (with DISTINCT to avoid duplicates from amenities JOIN)
+    COUNT(DISTINCT CASE WHEN u.occupancy_status = 'vacant' THEN u.id END) as available_units,
+    COUNT(DISTINCT u.id) as actual_units,
+    
+    -- Get amenities
+    COALESCE(
+        JSON_AGG(DISTINCT a.name ORDER BY a.name) FILTER (WHERE a.name IS NOT NULL), 
+        '[]'::json
+    ) as amenities
+    
+FROM properties p 
+LEFT JOIN units u ON p.id = u.property_id 
+LEFT JOIN property_amenities pa ON p.id = pa.property_id 
+LEFT JOIN amenities a ON pa.amenity_id = a.id 
+
+GROUP BY p.id, p.property_name, p.address, p.property_type, p.total_units, p.monthly_rent, p.security_deposit 
+HAVING COUNT(DISTINCT CASE WHEN u.occupancy_status = 'vacant' THEN u.id END) > 0 
+ORDER BY p.property_name
       `;
 
       const propertiesResult = await client.query(propertiesQuery);
@@ -973,13 +1226,13 @@ router.post("/onboard-with-unit", authenticateTokenSimple, async (req, res) => {
       `;
 
     // Handle empty strings for numeric and date fields
-    const processedMonthlyIncome = monthlyIncome && monthlyIncome.toString().trim() !== '' 
-      ? parseFloat(monthlyIncome) 
-      : null;
-    
-    const processedDateOfBirth = dateOfBirth && dateOfBirth.trim() !== '' 
-      ? dateOfBirth 
-      : null;
+    const processedMonthlyIncome =
+      monthlyIncome && monthlyIncome.toString().trim() !== ""
+        ? parseFloat(monthlyIncome)
+        : null;
+
+    const processedDateOfBirth =
+      dateOfBirth && dateOfBirth.trim() !== "" ? dateOfBirth : null;
 
     const tenantResult = await client.query(tenantQuery, [
       firstName,
@@ -1002,30 +1255,34 @@ router.post("/onboard-with-unit", authenticateTokenSimple, async (req, res) => {
     const primaryTenant = tenantResult.rows[0];
 
     // Determine lease amounts (use custom amounts if provided, otherwise use unit defaults)
-    const finalMonthlyRent = customMonthlyRent && customMonthlyRent.toString().trim() !== '' 
-      ? parseFloat(customMonthlyRent) 
-      : parseFloat(selectedUnit.monthly_rent);
-      
-    const finalSecurityDeposit = customSecurityDeposit && customSecurityDeposit.toString().trim() !== ''
-      ? parseFloat(customSecurityDeposit) 
-      : parseFloat(selectedUnit.security_deposit);
+    const finalMonthlyRent =
+      customMonthlyRent && customMonthlyRent.toString().trim() !== ""
+        ? parseFloat(customMonthlyRent)
+        : parseFloat(selectedUnit.monthly_rent);
+
+    const finalSecurityDeposit =
+      customSecurityDeposit && customSecurityDeposit.toString().trim() !== ""
+        ? parseFloat(customSecurityDeposit)
+        : parseFloat(selectedUnit.security_deposit);
 
     // Process other numeric fields
-    const processedPetDeposit = petDeposit && petDeposit.toString().trim() !== '' 
-      ? parseFloat(petDeposit) 
-      : 0;
-      
-    const processedLateFee = lateFee && lateFee.toString().trim() !== '' 
-      ? parseFloat(lateFee) 
-      : 0;
-      
-    const processedGracePeriodDays = gracePeriodDays && gracePeriodDays.toString().trim() !== '' 
-      ? parseInt(gracePeriodDays) 
-      : 5;
-      
-    const processedRentDueDay = rentDueDay && rentDueDay.toString().trim() !== '' 
-      ? parseInt(rentDueDay) 
-      : 1;
+    const processedPetDeposit =
+      petDeposit && petDeposit.toString().trim() !== ""
+        ? parseFloat(petDeposit)
+        : 0;
+
+    const processedLateFee =
+      lateFee && lateFee.toString().trim() !== "" ? parseFloat(lateFee) : 0;
+
+    const processedGracePeriodDays =
+      gracePeriodDays && gracePeriodDays.toString().trim() !== ""
+        ? parseInt(gracePeriodDays)
+        : 5;
+
+    const processedRentDueDay =
+      rentDueDay && rentDueDay.toString().trim() !== ""
+        ? parseInt(rentDueDay)
+        : 1;
 
     // Create or update lease
     let leaseId;
@@ -1122,13 +1379,16 @@ router.post("/onboard-with-unit", authenticateTokenSimple, async (req, res) => {
         coTenantId = coTenantEmailCheck.rows[0].id;
       } else {
         // Process co-tenant data same way as primary tenant
-        const coTenantProcessedMonthlyIncome = coTenant.monthlyIncome && coTenant.monthlyIncome.toString().trim() !== '' 
-          ? parseFloat(coTenant.monthlyIncome) 
-          : null;
-        
-        const coTenantProcessedDateOfBirth = coTenant.dateOfBirth && coTenant.dateOfBirth.trim() !== '' 
-          ? coTenant.dateOfBirth 
-          : null;
+        const coTenantProcessedMonthlyIncome =
+          coTenant.monthlyIncome &&
+          coTenant.monthlyIncome.toString().trim() !== ""
+            ? parseFloat(coTenant.monthlyIncome)
+            : null;
+
+        const coTenantProcessedDateOfBirth =
+          coTenant.dateOfBirth && coTenant.dateOfBirth.trim() !== ""
+            ? coTenant.dateOfBirth
+            : null;
 
         // Create new co-tenant
         const coTenantResult = await client.query(tenantQuery, [
@@ -1281,7 +1541,6 @@ router.get("/search/:query", authenticateTokenSimple, async (req, res) => {
     client.release();
   }
 });
-
 
 // Get all tenants with lease and property information
 router.get("/", authenticateTokenSimple, async (req, res) => {
@@ -1767,7 +2026,6 @@ router.post("/", authenticateTokenSimple, async (req, res) => {
   }
 });
 
-
 // Get single tenant by ID with detailed information
 router.get("/:id", authenticateTokenSimple, async (req, res) => {
   const client = await pool.connect();
@@ -1824,7 +2082,6 @@ router.get("/:id", authenticateTokenSimple, async (req, res) => {
   }
 });
 
-
 // Update tenant information
 router.put("/:id", authenticateTokenSimple, async (req, res) => {
   const client = await pool.connect();
@@ -1863,13 +2120,13 @@ router.put("/:id", authenticateTokenSimple, async (req, res) => {
     }
 
     // Handle empty strings for numeric and date fields - SAME AS ONBOARDING
-    const processedMonthlyIncome = monthlyIncome && monthlyIncome.toString().trim() !== '' 
-      ? parseFloat(monthlyIncome) 
-      : null;
-    
-    const processedDateOfBirth = dateOfBirth && dateOfBirth.trim() !== '' 
-      ? dateOfBirth 
-      : null;
+    const processedMonthlyIncome =
+      monthlyIncome && monthlyIncome.toString().trim() !== ""
+        ? parseFloat(monthlyIncome)
+        : null;
+
+    const processedDateOfBirth =
+      dateOfBirth && dateOfBirth.trim() !== "" ? dateOfBirth : null;
 
     // Update tenant with processed data
     const updateQuery = `
@@ -1899,17 +2156,17 @@ router.put("/:id", authenticateTokenSimple, async (req, res) => {
       lastName,
       email,
       phone,
-      alternatePhone || null,           // Handle empty strings
-      processedDateOfBirth,             // Processed date
-      identificationType || null,       // Handle empty strings
-      identificationNumber || null,     // Handle empty strings
-      emergencyContactName || null,     // Handle empty strings
-      emergencyContactPhone || null,    // Handle empty strings
+      alternatePhone || null, // Handle empty strings
+      processedDateOfBirth, // Processed date
+      identificationType || null, // Handle empty strings
+      identificationNumber || null, // Handle empty strings
+      emergencyContactName || null, // Handle empty strings
+      emergencyContactPhone || null, // Handle empty strings
       emergencyContactRelationship || null, // Handle empty strings
-      employmentStatus || null,         // Handle empty strings
-      employerName || null,             // Handle empty strings
-      processedMonthlyIncome,           // Processed numeric value
-      previousAddress || null,          // Handle empty strings
+      employmentStatus || null, // Handle empty strings
+      employerName || null, // Handle empty strings
+      processedMonthlyIncome, // Processed numeric value
+      previousAddress || null, // Handle empty strings
       tenantId,
     ]);
 
@@ -2122,7 +2379,6 @@ router.post("/:id/offboard", authenticateTokenSimple, async (req, res) => {
   }
 });
 
-
 // Get tenant payment history
 router.get("/:id/payments", authenticateTokenSimple, async (req, res) => {
   const client = await pool.connect();
@@ -2213,7 +2469,6 @@ router.get("/:id/documents", authenticateTokenSimple, async (req, res) => {
   }
 });
 
-
 // Upload tenant document
 router.post("/:id/documents", authenticateTokenSimple, async (req, res) => {
   const client = await pool.connect();
@@ -2296,8 +2551,6 @@ router.post("/:id/documents", authenticateTokenSimple, async (req, res) => {
     client.release();
   }
 });
-
-
 
 // Blacklist a tenant
 router.post(
@@ -2429,7 +2682,6 @@ router.post(
   }
 );
 
-
 // Remove from blacklist
 // Remove from blacklist
 router.post(
@@ -2483,7 +2735,15 @@ router.post(
         `INSERT INTO tenant_blacklist_history 
          (tenant_id, action, reason, notes, performed_by, previous_status, ip_address)
          VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        [tenantId, "removed", removalReason, notes, req.user.username, true, req.ip]
+        [
+          tenantId,
+          "removed",
+          removalReason,
+          notes,
+          req.user.username,
+          true,
+          req.ip,
+        ]
       );
 
       // THEN: Remove blacklist status (setting blacklisted_by to NULL is okay here)
@@ -2592,16 +2852,5 @@ router.get(
     }
   }
 );
-
-
-
-
-
-
-
-
-
-
-
 
 export default router;

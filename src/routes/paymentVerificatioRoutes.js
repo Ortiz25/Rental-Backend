@@ -1041,14 +1041,14 @@ router.put(
       await client.query("BEGIN");
 
       // Verify all submissions are pending and belong to valid tenants
-      const placeholders = submission_ids
+      const checkPlaceholders = submission_ids
         .map((_, index) => `$${index + 1}`)
         .join(",");
       const checkQuery = `
       SELECT ps.id, ps.amount, t.first_name || ' ' || t.last_name as tenant_name
       FROM payment_submissions ps
       JOIN tenants t ON ps.tenant_id = t.id
-      WHERE ps.id IN (${placeholders}) AND ps.verification_status = 'pending'
+      WHERE ps.id IN (${checkPlaceholders}) AND ps.verification_status = 'pending'
     `;
 
       const checkResult = await client.query(checkQuery, submission_ids);
@@ -1062,7 +1062,11 @@ router.put(
         });
       }
 
-      // Bulk update all submissions
+      // Bulk update all submissions - Fix the parameter indexing
+      const updatePlaceholders = submission_ids
+        .map((_, index) => `$${index + 3}`) // Start from $3 since $1 and $2 are used for verified_by and admin_notes
+        .join(",");
+      
       const updateQuery = `
       UPDATE payment_submissions 
       SET 
@@ -1071,7 +1075,7 @@ router.put(
         verified_by = $1,
         admin_notes = $2,
         updated_at = CURRENT_TIMESTAMP
-      WHERE id IN (${placeholders})
+      WHERE id IN (${updatePlaceholders})
       RETURNING id, amount
     `;
 

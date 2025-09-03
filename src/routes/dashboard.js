@@ -38,9 +38,9 @@ router.get('/dashboard/test', async (req, res) => {
   // Main dashboard route with simplified auth (for testing)
   router.get('/summary', authenticateTokenSimple, async (req, res) => {
     console.log('📊 Dashboard summary route accessed by user:', req.user?.id);
-    
+  
     const client = await pool.connect();
-    
+  
     try {
       // Check if user has appropriate role (but don't block if missing)
       const allowedRoles = ['Super Admin', 'Admin', 'Manager'];
@@ -82,26 +82,41 @@ router.get('/dashboard/test', async (req, res) => {
         FROM leases
       `;
   
-      // Financial Summary Query (simplified to avoid complex joins that might fail)
+      // Financial Summary Query (now includes collected + expected revenue)
       const financialQuery = `
         WITH monthly_payments AS (
           SELECT 
-            COALESCE(SUM(CASE WHEN payment_status = 'paid' AND payment_date >= DATE_TRUNC('month', CURRENT_DATE) THEN amount_paid END), 0) as monthly_revenue,
-            COALESCE(SUM(CASE WHEN payment_status IN ('overdue', 'pending') AND due_date < CURRENT_DATE THEN amount_due END), 0) as outstanding_rent
+            COALESCE(SUM(CASE WHEN payment_status = 'paid' 
+                              AND payment_date >= DATE_TRUNC('month', CURRENT_DATE) 
+                         THEN amount_paid END), 0) as collected_revenue,
+  
+            COALESCE(SUM(CASE WHEN payment_status IN ('overdue', 'pending') 
+                              AND due_date < CURRENT_DATE 
+                         THEN amount_due END), 0) as outstanding_rent
           FROM rent_payments
+        ),
+        monthly_expected AS (
+          SELECT 
+            COALESCE(SUM(amount_due), 0) as expected_revenue
+          FROM rent_payments
+          WHERE due_date >= DATE_TRUNC('month', CURRENT_DATE)
+            AND due_date < (DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month')
         ),
         monthly_maintenance AS (
           SELECT 
-            COALESCE(SUM(CASE WHEN completed_date >= DATE_TRUNC('month', CURRENT_DATE) THEN actual_cost END), 0) as maintenance_costs
+            COALESCE(SUM(CASE WHEN completed_date >= DATE_TRUNC('month', CURRENT_DATE) 
+                         THEN actual_cost END), 0) as maintenance_costs
           FROM maintenance_requests
           WHERE actual_cost IS NOT NULL
         )
         SELECT 
-          mp.monthly_revenue,
+          mp.collected_revenue,
+          me.expected_revenue,
           mp.outstanding_rent,
           mm.maintenance_costs as maintenance_costs_this_month
         FROM monthly_payments mp
-        CROSS JOIN monthly_maintenance mm
+        CROSS JOIN monthly_expected me
+        CROSS JOIN monthly_maintenance mm;
       `;
   
       // Maintenance Query
@@ -113,13 +128,14 @@ router.get('/dashboard/test', async (req, res) => {
         FROM maintenance_requests
       `;
   
-      // Execute queries with error handling for each
+      // Defaults
       let propertyData = { total_properties: 0, occupied_units: 0, vacant_units: 0 };
       let tenantData = { active_tenants: 0, lease_renewals_soon: 0, new_applications: 0 };
       let leaseData = { active_leases: 0, expiring_soon: 0, terminated_leases: 0 };
-      let financialData = { monthly_revenue: 0, outstanding_rent: 0, maintenance_costs_this_month: 0 };
+      let financialData = { collected_revenue: 0, expected_revenue: 0, outstanding_rent: 0, maintenance_costs_this_month: 0 };
       let maintenanceData = { open_requests: 0, completed_recently: 0, urgent_requests: 0 };
   
+      // Execute queries safely
       try {
         const propertyResult = await client.query(propertyQuery);
         propertyData = propertyResult.rows[0] || propertyData;
@@ -167,105 +183,46 @@ router.get('/dashboard/test', async (req, res) => {
             name: 'Property Overview',
             icon: 'BuildingIcon',
             stats: [
-              { 
-                label: 'Total Properties', 
-                value: parseInt(propertyData.total_properties) || 0, 
-                color: 'bg-blue-100' 
-              },
-              { 
-                label: 'Occupied', 
-                value: parseInt(propertyData.occupied_units) || 0, 
-                color: 'bg-green-100' 
-              },
-              { 
-                label: 'Vacant', 
-                value: parseInt(propertyData.vacant_units) || 0, 
-                color: 'bg-red-100' 
-              }
+              { label: 'Total Properties', value: parseInt(propertyData.total_properties) || 0, color: 'bg-blue-100' },
+              { label: 'Occupied', value: parseInt(propertyData.occupied_units) || 0, color: 'bg-green-100' },
+              { label: 'Vacant', value: parseInt(propertyData.vacant_units) || 0, color: 'bg-red-100' }
             ]
           },
           {
             name: 'Tenant Management',
             icon: 'UsersIcon',
             stats: [
-              { 
-                label: 'Active Tenants', 
-                value: parseInt(tenantData.active_tenants) || 0, 
-                color: 'bg-purple-100' 
-              },
-              { 
-                label: 'Lease Renewals', 
-                value: parseInt(tenantData.lease_renewals_soon) || 0, 
-                color: 'bg-yellow-100' 
-              },
-              { 
-                label: 'New Applications', 
-                value: parseInt(tenantData.new_applications) || 0, 
-                color: 'bg-indigo-100' 
-              }
+              { label: 'Active Tenants', value: parseInt(tenantData.active_tenants) || 0, color: 'bg-purple-100' },
+              { label: 'Lease Renewals', value: parseInt(tenantData.lease_renewals_soon) || 0, color: 'bg-yellow-100' },
+              { label: 'New Applications', value: parseInt(tenantData.new_applications) || 0, color: 'bg-indigo-100' }
             ]
           },
           {
             name: 'Lease Status',
             icon: 'FileTextIcon',
             stats: [
-              { 
-                label: 'Active Leases', 
-                value: parseInt(leaseData.active_leases) || 0, 
-                color: 'bg-green-100' 
-              },
-              { 
-                label: 'Expiring Soon', 
-                value: parseInt(leaseData.expiring_soon) || 0, 
-                color: 'bg-orange-100' 
-              },
-              { 
-                label: 'Terminated', 
-                value: parseInt(leaseData.terminated_leases) || 0, 
-                color: 'bg-red-100' 
-              }
+              { label: 'Active Leases', value: parseInt(leaseData.active_leases) || 0, color: 'bg-green-100' },
+              { label: 'Expiring Soon', value: parseInt(leaseData.expiring_soon) || 0, color: 'bg-orange-100' },
+              { label: 'Terminated', value: parseInt(leaseData.terminated_leases) || 0, color: 'bg-red-100' }
             ]
           },
           {
             name: 'Financial Summary',
             icon: 'DollarSignIcon',
             stats: [
-              { 
-                label: 'Monthly Revenue', 
-                value: `KES ${(parseFloat(financialData.monthly_revenue) || 0).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`, 
-                color: 'bg-blue-100' 
-              },
-              { 
-                label: 'Outstanding Rent', 
-                value: `KES ${(parseFloat(financialData.outstanding_rent) || 0).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`, 
-                color: 'bg-red-100' 
-              },
-              { 
-                label: 'Maintenance Costs', 
-                value: `KES ${(parseFloat(financialData.maintenance_costs_this_month) || 0).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`, 
-                color: 'bg-yellow-100' 
-              }
+              { label: 'Collected Revenue', value: `KES ${(parseFloat(financialData.collected_revenue) || 0).toLocaleString('en-US')}`, color: 'bg-blue-100' },
+              { label: 'Expected Revenue', value: `KES ${(parseFloat(financialData.expected_revenue) || 0).toLocaleString('en-US')}`, color: 'bg-indigo-100' },
+              { label: 'Outstanding Rent', value: `KES ${(parseFloat(financialData.outstanding_rent) || 0).toLocaleString('en-US')}`, color: 'bg-red-100' },
+              { label: 'Maintenance Costs', value: `KES ${(parseFloat(financialData.maintenance_costs_this_month) || 0).toLocaleString('en-US')}`, color: 'bg-yellow-100' }
             ]
           },
           {
             name: 'Maintenance',
             icon: 'WrenchIcon',
             stats: [
-              { 
-                label: 'Open Requests', 
-                value: parseInt(maintenanceData.open_requests) || 0, 
-                color: 'bg-orange-100' 
-              },
-              { 
-                label: 'Completed', 
-                value: parseInt(maintenanceData.completed_recently) || 0, 
-                color: 'bg-green-100' 
-              },
-              { 
-                label: 'Urgent', 
-                value: parseInt(maintenanceData.urgent_requests) || 0, 
-                color: 'bg-red-100' 
-              }
+              { label: 'Open Requests', value: parseInt(maintenanceData.open_requests) || 0, color: 'bg-orange-100' },
+              { label: 'Completed', value: parseInt(maintenanceData.completed_recently) || 0, color: 'bg-green-100' },
+              { label: 'Urgent', value: parseInt(maintenanceData.urgent_requests) || 0, color: 'bg-red-100' }
             ]
           }
         ],
@@ -283,7 +240,7 @@ router.get('/dashboard/test', async (req, res) => {
   
     } catch (error) {
       console.error('❌ Dashboard data fetch error:', error);
-      
+  
       res.status(500).json({
         status: 500,
         message: 'Failed to fetch dashboard data',
@@ -294,5 +251,6 @@ router.get('/dashboard/test', async (req, res) => {
       client.release();
     }
   });
+  
 
 export default  router;

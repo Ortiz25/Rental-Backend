@@ -144,6 +144,19 @@ router.get('/tenant/dashboard', authenticateTokenSimple, async (req, res) => {
       LIMIT 10
     `;
 
+    const tenantDocumentsQuery = `
+  SELECT 
+    id,
+    document_type,
+    document_name,
+    file_size,
+    upload_date
+  FROM tenant_documents
+  WHERE tenant_id = $1
+  ORDER BY upload_date DESC
+  LIMIT 10
+`;
+
     // Get payment submissions (pending verifications)
     const paymentSubmissionsQuery = `
       SELECT 
@@ -184,6 +197,8 @@ router.get('/tenant/dashboard', authenticateTokenSimple, async (req, res) => {
 
     console.log('💳 Executing payment submissions query...');
     const paymentSubmissions = await client.query(paymentSubmissionsQuery, [tenantId]);
+
+    const tenantDocumentsResult = await client.query(tenantDocumentsQuery, [tenantId]);
 
     // Check if tenant exists
     if (tenantInfo.rows.length === 0) {
@@ -284,6 +299,7 @@ router.get('/tenant/dashboard', authenticateTokenSimple, async (req, res) => {
         category: doc.category,
         isImportant: doc.is_important
       })),
+      tenantDocuments: tenantDocumentsResult.rows,
       stats: {
         overduePayments: parseInt(balance.overdue_count) || 0,
         activeMaintenanceRequests: maintenanceRequests.rows.filter(r => 
