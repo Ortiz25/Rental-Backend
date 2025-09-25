@@ -332,7 +332,7 @@ router.get('/', authenticateTokenSimple, async (req, res) => {
         bedrooms: Math.round(property.bedrooms) || 0,
         bathrooms: parseFloat(property.bathrooms) || 0,
         squareFootage: property.size_sq_ft || 0,
-        monthlyRent: parseFloat(property.avg_unit_rent) || parseFloat(property.base_monthly_rent) || 0,
+        monthlyRent:  parseFloat(property.base_monthly_rent) || 0,
         minRent: parseFloat(property.min_unit_rent) || parseFloat(property.base_monthly_rent) || 0,
         maxRent: parseFloat(property.max_unit_rent) || parseFloat(property.base_monthly_rent) || 0,
         securityDeposit: parseFloat(property.base_security_deposit) || 0,
@@ -509,7 +509,7 @@ router.put('/:id', authenticateTokenSimple, authorizeRole(['Super Admin', 'Admin
       description,
       amenities = []
     } = req.body;
-
+    
     // Update property
     const updateQuery = `
       UPDATE properties SET 

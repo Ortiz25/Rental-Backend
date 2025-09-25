@@ -123,7 +123,7 @@ router.get('/dashboard/test', async (req, res) => {
       const maintenanceQuery = `
         SELECT 
           COUNT(CASE WHEN status IN ('open', 'in_progress') THEN 1 END) as open_requests,
-          COUNT(CASE WHEN status = 'completed' AND completed_date >= CURRENT_DATE - INTERVAL '30 days' THEN 1 END) as completed_recently,
+          COUNT(CASE WHEN status = 'completed'  THEN 1 END) as completed_recently,
           COUNT(CASE WHEN priority = 'emergency' AND status NOT IN ('completed', 'cancelled') THEN 1 END) as urgent_requests
         FROM maintenance_requests
       `;
