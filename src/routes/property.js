@@ -5,8 +5,86 @@ import {
   authorizeRole,
   authenticateTokenSimple,
 } from "../middleware/auth.js";
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs';
 
 const router = express.Router();
+
+const uploadDir = '/home/files/rms-files/photos';
+
+const ensureDirectoryExists = (dirPath) => {
+  if (!fs.existsSync(dirPath)) {
+    try {
+      fs.mkdirSync(dirPath, { recursive: true, mode: 0o755 });
+      console.log(`Created directory: ${dirPath}`);
+    } catch (error) {
+      console.error(`Error creating directory ${dirPath}:`, error);
+      throw error;
+    }
+  }
+};
+
+ensureDirectoryExists(uploadDir);
+
+// Ensure upload directory exists
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
+
+// Configure multer for file uploads
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    // Ensure directory exists before each upload
+    ensureDirectoryExists(uploadDir);
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    // Create unique filename: property-timestamp-randomnumber.ext
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    const ext = path.extname(file.originalname);
+    const filename = `property-${uniqueSuffix}${ext}`;
+    cb(null, filename);
+  }
+});
+const fileFilter = (req, file, cb) => {
+  const allowedTypes = /jpeg|jpg|png|gif|webp/;
+  const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+  const mimetype = allowedTypes.test(file.mimetype);
+  
+  if (mimetype && extname) {
+    return cb(null, true);
+  } else {
+    cb(new Error('Only image files (JPEG, PNG, GIF, WebP) are allowed!'));
+  }
+};
+
+const upload = multer({
+  storage: storage,
+  limits: {
+    fileSize: 5 * 1024 * 1024 // 5MB limit per file
+  },
+  fileFilter: fileFilter
+});
+
+// Add new route to serve uploaded images
+// Serve uploaded images
+router.get('/photos/:filename', (req, res) => {
+  const filename = req.params.filename;
+  const filepath = path.join(uploadDir, filename);
+  
+  // Check if file exists
+  if (fs.existsSync(filepath)) {
+    // Set appropriate cache headers
+    res.setHeader('Cache-Control', 'public, max-age=86400'); // Cache for 1 day
+    res.sendFile(filepath);
+  } else {
+    res.status(404).json({ 
+      status: 404,
+      message: 'Photo not found' 
+    });
+  }
+});
 
 // Get available amenities - MOVED BEFORE parameterized routes
 router.get("/amenities", authenticateTokenSimple, async (req, res) => {
@@ -33,16 +111,21 @@ router.get("/amenities", authenticateTokenSimple, async (req, res) => {
 });
 
 // Create new property - MOVED BEFORE parameterized routes
+// Create new property with photo uploads
 router.post(
   "/",
   authenticateTokenSimple,
   authorizeRole(["Super Admin", "Admin", "Manager"]),
+  upload.array('photos', 10), // Allow up to 10 photos
   async (req, res) => {
     const client = await pool.connect();
 
     try {
       await client.query("BEGIN");
 
+      // Parse JSON data from form-data
+      const propertyData = JSON.parse(req.body.propertyData || '{}');
+      
       const {
         propertyName,
         address,
@@ -54,10 +137,19 @@ router.post(
         description,
         amenities = [],
         units = [],
-      } = req.body;
+      } = propertyData;
 
       // Validate required fields
       if (!propertyName || !address || !propertyType) {
+        // Clean up uploaded files if validation fails
+        if (req.files) {
+          req.files.forEach(file => {
+            if (fs.existsSync(file.path)) {
+              fs.unlinkSync(file.path);
+            }
+          });
+        }
+        
         return res.status(400).json({
           status: 400,
           message: "Property name, address, and type are required",
@@ -66,12 +158,12 @@ router.post(
 
       // Insert property
       const propertyQuery = `
-      INSERT INTO properties (
-        property_name, address, property_type, total_units, 
-        size_sq_ft, monthly_rent, security_deposit, description
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      RETURNING *
-    `;
+        INSERT INTO properties (
+          property_name, address, property_type, total_units, 
+          size_sq_ft, monthly_rent, security_deposit, description
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        RETURNING *
+      `;
 
       const propertyResult = await client.query(propertyQuery, [
         propertyName,
@@ -86,6 +178,30 @@ router.post(
 
       const newProperty = propertyResult.rows[0];
 
+      // Handle photo uploads
+      if (req.files && req.files.length > 0) {
+        for (let i = 0; i < req.files.length; i++) {
+          const file = req.files[i];
+          const photoQuery = `
+            INSERT INTO property_photos (
+              property_id, file_name, file_path, file_size, 
+              mime_type, is_primary, display_order, uploaded_by
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING id
+          `;
+          
+          await client.query(photoQuery, [
+            newProperty.id,
+            file.filename,          // Store just the filename
+            file.path,              // Full path: /home/files/rms-files/photos/filename.jpg
+            file.size,
+            file.mimetype,
+            i === 0,                // First photo is primary
+            i,
+            req.user.id
+          ]);
+        }
+      }
       // Add amenities if provided
       if (amenities && amenities.length > 0) {
         for (const amenityName of amenities) {
@@ -105,25 +221,25 @@ router.post(
         }
       }
 
-      // FIXED: Handle unit creation logic properly
+      // Handle unit creation logic
       if (units && units.length > 0) {
-        // For properties with explicit units, we need to handle the trigger-created unit
+        // For properties with explicit units, handle the trigger-created unit
         if (propertyType !== "Apartment" && totalUnits === 1) {
-          // The trigger already created a "Main" unit, so we should update it instead of inserting
+          // The trigger already created a "Main" unit, so update it instead of inserting
           const unit = units[0]; // Assuming single unit for non-apartment properties
 
           if (unit.unitNumber === "Main" || !unit.unitNumber) {
             // Update the trigger-created unit
             await client.query(
               `UPDATE units SET 
-              bedrooms = $1, 
-              bathrooms = $2, 
-              size_sq_ft = $3, 
-              monthly_rent = $4, 
-              security_deposit = $5, 
-              occupancy_status = $6,
-              updated_at = CURRENT_TIMESTAMP
-            WHERE property_id = $7 AND unit_number = 'Main'`,
+                bedrooms = $1, 
+                bathrooms = $2, 
+                size_sq_ft = $3, 
+                monthly_rent = $4, 
+                security_deposit = $5, 
+                occupancy_status = $6,
+                updated_at = CURRENT_TIMESTAMP
+              WHERE property_id = $7 AND unit_number = 'Main'`,
               [
                 unit.bedrooms || 0,
                 unit.bathrooms || 0,
@@ -143,9 +259,9 @@ router.post(
 
             await client.query(
               `INSERT INTO units (
-              property_id, unit_number, bedrooms, bathrooms, 
-              size_sq_ft, monthly_rent, security_deposit, occupancy_status
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+                property_id, unit_number, bedrooms, bathrooms, 
+                size_sq_ft, monthly_rent, security_deposit, occupancy_status
+              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
               [
                 newProperty.id,
                 unit.unitNumber,
@@ -164,9 +280,9 @@ router.post(
           for (const unit of units) {
             await client.query(
               `INSERT INTO units (
-              property_id, unit_number, bedrooms, bathrooms, 
-              size_sq_ft, monthly_rent, security_deposit, occupancy_status
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+                property_id, unit_number, bedrooms, bathrooms, 
+                size_sq_ft, monthly_rent, security_deposit, occupancy_status
+              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
               [
                 newProperty.id,
                 unit.unitNumber || "Main",
@@ -183,15 +299,18 @@ router.post(
       }
       // If no units provided, the trigger will handle creating the default unit for non-apartments
 
+      // Get photo count for logging
+      const photoCount = req.files ? req.files.length : 0;
+
       // Log activity
       await client.query(
         `INSERT INTO user_activity_log 
-       (user_id, activity_type, activity_description, affected_resource_type, affected_resource_id, ip_address, user_agent)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+         (user_id, activity_type, activity_description, affected_resource_type, affected_resource_id, ip_address, user_agent)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
         [
           req.user.id,
           "property_created",
-          `Created new property: ${propertyName}`,
+          `Created new property: ${propertyName}${photoCount > 0 ? ` with ${photoCount} photos` : ''}`,
           "property",
           newProperty.id,
           req.ip,
@@ -204,17 +323,33 @@ router.post(
       res.status(201).json({
         status: 201,
         message: "Property created successfully",
-        data: newProperty,
+        data: {
+          ...newProperty,
+          photoCount: photoCount
+        },
       });
     } catch (error) {
       await client.query("ROLLBACK");
+      
+      // Clean up uploaded files on error
+      if (req.files) {
+        req.files.forEach(file => {
+          if (fs.existsSync(file.path)) {
+            try {
+              fs.unlinkSync(file.path);
+            } catch (unlinkError) {
+              console.error('Error deleting file:', unlinkError);
+            }
+          }
+        });
+      }
+      
       console.error("Property creation error:", error);
 
       res.status(500).json({
         status: 500,
         message: "Failed to create property",
-        error:
-          process.env.NODE_ENV === "development" ? error.message : undefined,
+        error: process.env.NODE_ENV === "development" ? error.message : undefined,
       });
     } finally {
       client.release();
@@ -434,6 +569,47 @@ router.get("/", authenticateTokenSimple, async (req, res) => {
     res.status(500).json({
       status: 500,
       message: "Failed to fetch properties",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// Get photos for a specific property
+router.get("/:propertyId/photos", authenticateTokenSimple, async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { propertyId } = req.params;
+
+    const photosQuery = `
+      SELECT 
+        id,
+        file_name,
+        file_path,
+        is_primary,
+        display_order,
+        caption,
+        uploaded_at
+      FROM property_photos
+      WHERE property_id = $1
+      ORDER BY is_primary DESC, display_order ASC, uploaded_at ASC
+    `;
+
+    const result = await client.query(photosQuery, [propertyId]);
+
+    res.status(200).json({
+      status: 200,
+      message: "Photos retrieved successfully",
+      data: result.rows,
+    });
+  } catch (error) {
+    console.error("Photos fetch error:", error);
+
+    res.status(500).json({
+      status: 500,
+      message: "Failed to fetch photos",
       error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   } finally {
@@ -911,6 +1087,200 @@ router.put(
         message: "Failed to update unit",
         error:
           process.env.NODE_ENV === "development" ? error.message : undefined,
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// Upload new photos to existing property
+router.post(
+  "/:propertyId/photos",
+  authenticateTokenSimple,
+  authorizeRole(["Super Admin", "Admin", "Manager"]),
+  upload.array('photos', 10),
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      const { propertyId } = req.params;
+
+      if (!req.files || req.files.length === 0) {
+        return res.status(400).json({
+          status: 400,
+          message: "No photos provided",
+        });
+      }
+
+      await client.query("BEGIN");
+
+      const uploadedPhotos = [];
+
+      for (let i = 0; i < req.files.length; i++) {
+        const file = req.files[i];
+        const photoQuery = `
+          INSERT INTO property_photos (
+            property_id, file_name, file_path, file_size, 
+            mime_type, is_primary, display_order, uploaded_by
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+          RETURNING *
+        `;
+        
+        const result = await client.query(photoQuery, [
+          propertyId,
+          file.filename,
+          file.path,
+          file.size,
+          file.mimetype,
+          false, // New photos are not primary by default
+          i,
+          req.user.id
+        ]);
+
+        uploadedPhotos.push(result.rows[0]);
+      }
+
+      await client.query("COMMIT");
+
+      res.status(201).json({
+        status: 201,
+        message: "Photos uploaded successfully",
+        data: uploadedPhotos,
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      
+      if (req.files) {
+        req.files.forEach(file => {
+          if (fs.existsSync(file.path)) {
+            fs.unlinkSync(file.path);
+          }
+        });
+      }
+
+      console.error("Photo upload error:", error);
+      res.status(500).json({
+        status: 500,
+        message: "Failed to upload photos",
+        error: process.env.NODE_ENV === "development" ? error.message : undefined,
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// Delete a specific photo
+router.delete(
+  "/:propertyId/photos/:photoId",
+  authenticateTokenSimple,
+  authorizeRole(["Super Admin", "Admin", "Manager"]),
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      const { propertyId, photoId } = req.params;
+
+      // Get photo info
+      const photoResult = await client.query(
+        "SELECT * FROM property_photos WHERE id = $1 AND property_id = $2",
+        [photoId, propertyId]
+      );
+
+      if (photoResult.rows.length === 0) {
+        return res.status(404).json({
+          status: 404,
+          message: "Photo not found",
+        });
+      }
+
+      const photo = photoResult.rows[0];
+
+      // Delete from database first
+      await client.query(
+        "DELETE FROM property_photos WHERE id = $1",
+        [photoId]
+      );
+
+      // Delete physical file from server
+      const filePath = photo.file_path;
+      if (fs.existsSync(filePath)) {
+        try {
+          fs.unlinkSync(filePath);
+          console.log(`Deleted photo file: ${filePath}`);
+        } catch (error) {
+          console.error(`Error deleting file ${filePath}:`, error);
+          // Continue even if file deletion fails - DB record is already deleted
+        }
+      } else {
+        console.warn(`Photo file not found at path: ${filePath}`);
+      }
+
+      res.status(200).json({
+        status: 200,
+        message: "Photo deleted successfully",
+      });
+    } catch (error) {
+      console.error("Photo deletion error:", error);
+      res.status(500).json({
+        status: 500,
+        message: "Failed to delete photo",
+        error: process.env.NODE_ENV === "development" ? error.message : undefined,
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// Set primary photo
+router.put(
+  "/:propertyId/photos/:photoId/set-primary",
+  authenticateTokenSimple,
+  authorizeRole(["Super Admin", "Admin", "Manager"]),
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      const { propertyId, photoId } = req.params;
+
+      // Remove primary flag from all photos of this property
+      await client.query(
+        "UPDATE property_photos SET is_primary = false WHERE property_id = $1",
+        [propertyId]
+      );
+
+      // Set the selected photo as primary
+      const result = await client.query(
+        "UPDATE property_photos SET is_primary = true WHERE id = $1 AND property_id = $2 RETURNING *",
+        [photoId, propertyId]
+      );
+
+      if (result.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({
+          status: 404,
+          message: "Photo not found",
+        });
+      }
+
+      await client.query("COMMIT");
+
+      res.status(200).json({
+        status: 200,
+        message: "Primary photo updated successfully",
+        data: result.rows[0],
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      console.error("Set primary photo error:", error);
+      res.status(500).json({
+        status: 500,
+        message: "Failed to set primary photo",
+        error: process.env.NODE_ENV === "development" ? error.message : undefined,
       });
     } finally {
       client.release();

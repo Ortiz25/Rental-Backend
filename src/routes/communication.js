@@ -419,159 +419,38 @@ router.get('/stats', authenticateTokenSimple, async (req, res) => {
 // Get announcements (using user_notifications table)
 
 router.get('/announcements', authenticateTokenSimple, async (req, res) => {
-    console.log('📢 Getting announcements for user:', req.user?.id);
+  console.log('📢 Getting announcements for user:', req.user?.id);
+  
+  const client = await pool.connect();
+  
+  try {
+    const { 
+      page = 1, 
+      limit = 10, 
+      priority = 'all'
+    } = req.query;
     
-    const client = await pool.connect();
+    const offset = (page - 1) * limit;
     
-    try {
-      const { 
-        page = 1, 
-        limit = 10, 
-        priority = 'all'
-      } = req.query;
-      
-      const offset = (page - 1) * limit;
-      
-      // First, let's check if user_notifications table has any data
-      const checkTableQuery = `
-        SELECT COUNT(*) as count 
-        FROM user_notifications 
-        WHERE notification_type = 'announcement'
-      `;
-      
-      const checkResult = await client.query(checkTableQuery);
-      const totalCount = parseInt(checkResult.rows[0].count);
-      
-      if (totalCount === 0) {
-        // Return empty result if no announcements exist
-        return res.status(200).json({
-          status: 200,
-          message: 'No announcements found',
-          data: {
-            announcements: [],
-            pagination: {
-              currentPage: parseInt(page),
-              totalPages: 0,
-              totalAnnouncements: 0,
-              hasNextPage: false,
-              hasPreviousPage: false
-            }
-          }
-        });
-      }
-      
-      // Build the main query
-      let mainQuery = `
-        SELECT 
-          n.id,
-          n.title,
-          n.message as content,
-          n.is_urgent,
-          n.created_at,
-          n.is_read
-        FROM user_notifications n
-        WHERE notification_type = 'announcement'
-      `;
-      
-      let countQuery = `
-        SELECT COUNT(*) as total
-        FROM user_notifications n
-        WHERE notification_type = 'announcement'
-      `;
-      
-      let queryParams = [];
-      let paramCount = 0;
-      
-      // Add user filter for tenants
-      if (req.user.role === 'Tenant') {
-        paramCount++;
-        mainQuery += ` AND n.user_id = $${paramCount}`;
-        countQuery += ` AND n.user_id = $${paramCount}`;
-        queryParams.push(req.user.id);
-      }
-      
-      // Add priority filter
-      if (priority !== 'all') {
-        paramCount++;
-        const isUrgent = priority === 'high';
-        mainQuery += ` AND n.is_urgent = $${paramCount}`;
-        countQuery += ` AND n.is_urgent = $${paramCount}`;
-        queryParams.push(isUrgent);
-      }
-      
-      // Store count params
-      const countParams = [...queryParams];
-      
-      // Add ordering and pagination to main query
-      mainQuery += ` ORDER BY n.created_at DESC`;
-      
-      // Add limit
-      paramCount++;
-      mainQuery += ` LIMIT $${paramCount}`;
-      queryParams.push(parseInt(limit));
-      
-      // Add offset
-      paramCount++;
-      mainQuery += ` OFFSET $${paramCount}`;
-      queryParams.push(parseInt(offset));
-      
-      console.log('Main query:', mainQuery);
-      console.log('Count query:', countQuery);
-      console.log('Main params:', queryParams);
-      console.log('Count params:', countParams);
-      
-      const [announcementsResult, countResult] = await Promise.all([
-        client.query(mainQuery, queryParams),
-        client.query(countQuery, countParams)
-      ]);
-      
-      const announcements = announcementsResult.rows.map(row => ({
-        id: row.id,
-        title: row.title,
-        content: row.content,
-        priority: row.is_urgent ? 'high' : 'normal',
-        date: new Date(row.created_at).toISOString().split('T')[0],
-        recipients: req.user.role === 'Tenant' ? 'You' : 'All Tenants',
-        isRead: row.is_read,
-        createdBy: 'System'
-      }));
-      
-      const totalAnnouncements = parseInt(countResult.rows[0].total);
-      const totalPages = Math.ceil(totalAnnouncements / limit);
-      
-      res.status(200).json({
+    // First, let's check if user_notifications table has any data
+    const checkTableQuery = `
+      SELECT COUNT(*) as count 
+      FROM user_notifications 
+      WHERE notification_type = 'announcement'
+    `;
+    
+    const checkResult = await client.query(checkTableQuery);
+    const totalCount = parseInt(checkResult.rows[0].count);
+    
+    if (totalCount === 0) {
+      // Return empty result if no announcements exist
+      return res.status(200).json({
         status: 200,
-        message: 'Announcements retrieved successfully',
-        data: {
-          announcements,
-          pagination: {
-            currentPage: parseInt(page),
-            totalPages,
-            totalAnnouncements,
-            hasNextPage: page < totalPages,
-            hasPreviousPage: page > 1
-          }
-        }
-      });
-      
-    } catch (error) {
-      console.error('❌ Error fetching announcements:', error);
-      console.error('Full error details:', {
-        message: error.message,
-        code: error.code,
-        position: error.position,
-        detail: error.detail,
-        hint: error.hint
-      });
-      
-      // Return empty result on error to prevent crashes
-      res.status(200).json({
-        status: 200,
-        message: 'Announcements retrieved (with errors)',
+        message: 'No announcements found',
         data: {
           announcements: [],
           pagination: {
-            currentPage: parseInt(req.query.page || 1),
+            currentPage: parseInt(page),
             totalPages: 0,
             totalAnnouncements: 0,
             hasNextPage: false,
@@ -579,142 +458,478 @@ router.get('/announcements', authenticateTokenSimple, async (req, res) => {
           }
         }
       });
-    } finally {
-      client.release();
     }
-  });
-  router.post('/announcements', authenticateTokenSimple, async (req, res) => {
-    console.log('📢 Creating announcement from user:', req.user?.id);
     
-    // Only allow staff to create announcements
+    // Build the main query with enhanced user and property information
+    let mainQuery = `
+      SELECT 
+        n.id,
+        n.title,
+        n.message as content,
+        n.is_urgent,
+        n.created_at,
+        n.is_read,
+        n.user_id,
+        n.target_scope,
+        n.target_property_id,
+        n.status,
+        n.scheduled_for,
+        -- User information
+        u.username,
+        u.email as user_email,
+        u.first_name,
+        u.last_name,
+        u.phone as user_phone,
+        ur.role_name,
+        -- Tenant information (if user is a tenant)
+        t.id as tenant_id,
+        t.email as tenant_email,
+        t.phone as tenant_phone,
+        t.alternate_phone,
+        t.employment_status,
+        t.monthly_income,
+        -- Property information (if user is a tenant with active lease)
+        p.id as property_id,
+        p.property_name,
+        p.address as property_address,
+        p.property_type,
+        u_unit.unit_number,
+        u_unit.bedrooms,
+        u_unit.bathrooms,
+        u_unit.size_sq_ft,
+        l.id as lease_id,
+        l.lease_number,
+        l.monthly_rent,
+        l.start_date as lease_start_date,
+        l.end_date as lease_end_date,
+        l.lease_status,
+        -- Target property information (for property-specific announcements)
+        target_p.property_name as target_property_name
+      FROM user_notifications n
+      JOIN users u ON n.user_id = u.id
+      JOIN user_roles ur ON u.role_id = ur.id
+      LEFT JOIN tenants t ON u.tenant_id = t.id
+      LEFT JOIN lease_tenants lt ON t.id = lt.tenant_id AND lt.removed_date IS NULL
+      LEFT JOIN leases l ON lt.lease_id = l.id AND l.lease_status = 'active'
+      LEFT JOIN units u_unit ON l.unit_id = u_unit.id
+      LEFT JOIN properties p ON u_unit.property_id = p.id
+      LEFT JOIN properties target_p ON n.target_property_id = target_p.id
+      WHERE n.notification_type = 'announcement'
+    `;
+    
+    let countQuery = `
+      SELECT COUNT(*) as total
+      FROM user_notifications n
+      JOIN users u ON n.user_id = u.id
+      WHERE n.notification_type = 'announcement'
+    `;
+    
+    let queryParams = [];
+    let paramCount = 0;
+    
+    // Add user filter for tenants
     if (req.user.role === 'Tenant') {
-      return res.status(403).json({
-        status: 403,
-        message: 'Only staff members can create announcements'
-      });
+      paramCount++;
+      mainQuery += ` AND n.user_id = $${paramCount}`;
+      countQuery += ` AND n.user_id = $${paramCount}`;
+      queryParams.push(req.user.id);
     }
     
-    const client = await pool.connect();
-    
-    try {
-      const {
-        title,
-        content,
-        priority = 'normal',
-        recipients = 'all',
-        property_id = null
-      } = req.body;
-      
-      // Validation
-      if (!title || !content) {
-        return res.status(400).json({
-          status: 400,
-          message: 'Title and content are required'
-        });
-      }
-      
-      await client.query('BEGIN');
-      
-      let targetUsers = [];
-      
-      // Get target users based on recipients
-      if (recipients === 'all') {
-        // Get all tenant users
-        const allTenantsQuery = `
-          SELECT DISTINCT u.id 
-          FROM users u 
-          JOIN user_roles ur ON u.role_id = ur.id 
-          WHERE ur.role_name = 'Tenant' AND u.is_active = true
-        `;
-        const result = await client.query(allTenantsQuery);
-        targetUsers = result.rows.map(row => row.id);
-        
-      } else if (property_id) {
-        // Get users for specific property
-        const propertyTenantsQuery = `
-          SELECT DISTINCT u.id
-          FROM users u
-          JOIN user_roles ur ON u.role_id = ur.id
-          JOIN tenants t ON u.tenant_id = t.id
-          JOIN lease_tenants lt ON t.id = lt.tenant_id
-          JOIN leases l ON lt.lease_id = l.id
-          JOIN units un ON l.unit_id = un.id
-          WHERE ur.role_name = 'Tenant' 
-          AND u.is_active = true 
-          AND lt.removed_date IS NULL 
-          AND l.lease_status = 'active'
-          AND un.property_id = $1
-        `;
-        const result = await client.query(propertyTenantsQuery, [property_id]);
-        targetUsers = result.rows.map(row => row.id);
-      }
-      
-      if (targetUsers.length === 0) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({
-          status: 400,
-          message: 'No valid recipients found'
-        });
-      }
-      
-      // Create notifications for all target users
+    // Add priority filter
+    if (priority !== 'all') {
+      paramCount++;
       const isUrgent = priority === 'high';
-      let successCount = 0;
-      
-      for (const userId of targetUsers) {
-        try {
-          await client.query(`
-            INSERT INTO user_notifications 
-            (user_id, notification_type, title, message, is_urgent, created_at)
-            VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
-          `, [userId, 'announcement', title, content, isUrgent]);
-          successCount++;
-        } catch (notifError) {
-          console.log(`Failed to create notification for user ${userId}:`, notifError.message);
-        }
-      }
-      
-      // Log activity if possible
-      if (req.user.id) {
-        try {
-          await client.query(`
-            INSERT INTO user_activity_log 
-            (user_id, activity_type, activity_description, activity_timestamp)
-            VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
-          `, [
-            req.user.id,
-            'announcement_created',
-            `Created announcement: ${title}`
-          ]);
-        } catch (logError) {
-          console.log('Could not log activity:', logError.message);
-        }
-      }
-      
-      await client.query('COMMIT');
-      
-      res.status(201).json({
-        status: 201,
-        message: 'Announcement sent successfully',
-        data: {
-          title,
-          recipientCount: successCount,
-          timestamp: new Date().toISOString()
-        }
-      });
-      
-    } catch (error) {
-      await client.query('ROLLBACK');
-      console.error('❌ Error creating announcement:', error);
-      res.status(500).json({
-        status: 500,
-        message: 'Failed to create announcement',
-        error: process.env.NODE_ENV === 'development' ? error.message : undefined
-      });
-    } finally {
-      client.release();
+      mainQuery += ` AND n.is_urgent = $${paramCount}`;
+      countQuery += ` AND n.is_urgent = $${paramCount}`;
+      queryParams.push(isUrgent);
     }
-  });
+    
+    // Store count params
+    const countParams = [...queryParams];
+    
+    // Add ordering and pagination to main query
+    mainQuery += ` ORDER BY n.created_at DESC`;
+    
+    // Add limit
+    paramCount++;
+    mainQuery += ` LIMIT $${paramCount}`;
+    queryParams.push(parseInt(limit));
+    
+    // Add offset
+    paramCount++;
+    mainQuery += ` OFFSET $${paramCount}`;
+    queryParams.push(parseInt(offset));
+    
+    console.log('Main query:', mainQuery);
+    console.log('Count query:', countQuery);
+    console.log('Main params:', queryParams);
+    console.log('Count params:', countParams);
+    
+    const [announcementsResult, countResult] = await Promise.all([
+      client.query(mainQuery, queryParams),
+      client.query(countQuery, countParams)
+    ]);
+    
+    const announcements = announcementsResult.rows.map(row => {
+      // Determine recipients text based on target_scope
+      let recipientsText;
+      if (req.user.role === 'Tenant') {
+        recipientsText = 'You';
+      } else if (row.target_scope === 'all_tenants') {
+        recipientsText = 'All Tenants';
+      } else if (row.target_scope === 'property_specific' && row.target_property_name) {
+        recipientsText = `${row.target_property_name} Tenants`;
+      } else {
+        recipientsText = 'All Tenants'; // Fallback
+      }
+
+      const baseAnnouncement = {
+        id: row.id,
+        title: row.title,
+        content: row.content,
+        priority: row.is_urgent ? 'high' : 'normal',
+        date: new Date(row.created_at).toISOString().split('T')[0],
+        recipients: recipientsText,
+        isRead: row.is_read,
+        createdBy: 'System',
+        status: row.status,
+        scheduledFor: row.scheduled_for,
+        targetScope: row.target_scope,
+        targetPropertyId: row.target_property_id,
+        targetPropertyName: row.target_property_name
+      };
+
+      // Add user information
+      const userInfo = {
+        userId: row.user_id,
+        username: row.username,
+        userEmail: row.user_email,
+        firstName: row.first_name,
+        lastName: row.last_name,
+        fullName: `${row.first_name} ${row.last_name}`,
+        userPhone: row.user_phone,
+        role: row.role_name
+      };
+
+      // Add tenant-specific information if user is a tenant
+      if (row.role_name === 'Tenant' && row.tenant_id) {
+        const tenantInfo = {
+          tenantId: row.tenant_id,
+          tenantEmail: row.tenant_email,
+          tenantPhone: row.tenant_phone,
+          alternatePhone: row.alternate_phone,
+          employmentStatus: row.employment_status,
+          monthlyIncome: row.monthly_income
+        };
+
+        // Add property information if tenant has an active lease
+        if (row.property_id) {
+          const propertyInfo = {
+            propertyId: row.property_id,
+            propertyName: row.property_name,
+            propertyAddress: row.property_address,
+            propertyType: row.property_type,
+            unitNumber: row.unit_number,
+            bedrooms: row.bedrooms,
+            bathrooms: row.bathrooms,
+            sizeSquareFeet: row.size_sq_ft,
+            leaseId: row.lease_id,
+            leaseNumber: row.lease_number,
+            monthlyRent: parseFloat(row.monthly_rent || 0),
+            leaseStartDate: row.lease_start_date,
+            leaseEndDate: row.lease_end_date,
+            leaseStatus: row.lease_status,
+            propertyUnit: `${row.property_name} - Unit ${row.unit_number}`
+          };
+
+          return {
+            ...baseAnnouncement,
+            user: userInfo,
+            tenant: tenantInfo,
+            property: propertyInfo
+          };
+        } else {
+          return {
+            ...baseAnnouncement,
+            user: userInfo,
+            tenant: tenantInfo,
+            property: null
+          };
+        }
+      } else {
+        return {
+          ...baseAnnouncement,
+          user: userInfo,
+          tenant: null,
+          property: null
+        };
+      }
+    });
+    
+    const totalAnnouncements = parseInt(countResult.rows[0].total);
+    const totalPages = Math.ceil(totalAnnouncements / limit);
+    
+    res.status(200).json({
+      status: 200,
+      message: 'Announcements retrieved successfully',
+      data: {
+        announcements,
+        pagination: {
+          currentPage: parseInt(page),
+          totalPages,
+          totalAnnouncements,
+          hasNextPage: page < totalPages,
+          hasPreviousPage: page > 1
+        }
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Error fetching announcements:', error);
+    console.error('Full error details:', {
+      message: error.message,
+      code: error.code,
+      position: error.position,
+      detail: error.detail,
+      hint: error.hint
+    });
+    
+    // Return empty result on error to prevent crashes
+    res.status(200).json({
+      status: 200,
+      message: 'Announcements retrieved (with errors)',
+      data: {
+        announcements: [],
+        pagination: {
+          currentPage: parseInt(req.query.page || 1),
+          totalPages: 0,
+          totalAnnouncements: 0,
+          hasNextPage: false,
+          hasPreviousPage: false
+        }
+      }
+    });
+  } finally {
+    client.release();
+  }
+});
+
+router.post('/announcements', authenticateTokenSimple, async (req, res) => {
+  console.log('📢 Creating announcement from user:', req.user?.id);
+  
+  if (req.user.role === 'Tenant') {
+    return res.status(403).json({
+      status: 403,
+      message: 'Only staff members can create announcements'
+    });
+  }
+  
+  const client = await pool.connect();
+  
+  try {
+    const {
+      title,
+      content,
+      priority = 'normal',
+      recipients = 'all',
+      property_id = null,
+      scheduled_for = null,
+      send_now = true
+    } = req.body;
+    
+    if (!title || !content) {
+      return res.status(400).json({
+        status: 400,
+        message: 'Title and content are required'
+      });
+    }
+
+    // Validate scheduled_for if provided
+    if (scheduled_for && new Date(scheduled_for) <= new Date()) {
+      return res.status(400).json({
+        status: 400,
+        message: 'Scheduled time must be in the future'
+      });
+    }
+    
+    await client.query('BEGIN');
+    
+    let targetUsers = [];
+    
+    if (recipients === 'all') {
+      const allTenantsQuery = `
+        SELECT DISTINCT u.id 
+        FROM users u 
+        JOIN user_roles ur ON u.role_id = ur.id 
+        WHERE ur.role_name = 'Tenant' AND u.is_active = true
+      `;
+      const result = await client.query(allTenantsQuery);
+      targetUsers = result.rows.map(row => row.id);
+      
+    } else if (property_id) {
+      const propertyTenantsQuery = `
+        SELECT DISTINCT u.id
+        FROM users u
+        JOIN user_roles ur ON u.role_id = ur.id
+        JOIN tenants t ON u.tenant_id = t.id
+        JOIN lease_tenants lt ON t.id = lt.tenant_id
+        JOIN leases l ON lt.lease_id = l.id
+        JOIN units un ON l.unit_id = un.id
+        WHERE ur.role_name = 'Tenant' 
+        AND u.is_active = true 
+        AND lt.removed_date IS NULL 
+        AND l.lease_status = 'active'
+        AND un.property_id = $1
+      `;
+      const result = await client.query(propertyTenantsQuery, [property_id]);
+      targetUsers = result.rows.map(row => row.id);
+    }
+    
+    if (targetUsers.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        status: 400,
+        message: 'No valid recipients found'
+      });
+    }
+    
+    const isUrgent = priority === 'high';
+    const notificationStatus = send_now ? 'sent' : 'scheduled';
+    const scheduledTime = send_now ? null : scheduled_for;
+    
+    // Determine target scope and property ID for metadata
+    const targetScope = recipients === 'all' ? 'all_tenants' : 'property_specific';
+    const targetPropertyId = (recipients === 'property' && property_id) ? property_id : null;
+    
+    let successCount = 0;
+    
+    for (const userId of targetUsers) {
+      try {
+        await client.query(`
+          INSERT INTO user_notifications 
+          (
+            user_id, 
+            notification_type, 
+            title, 
+            message, 
+            is_urgent, 
+            scheduled_for, 
+            status, 
+            created_by,
+            target_scope,
+            target_property_id,
+            target_user_ids,
+            created_at
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP)
+        `, [
+          userId, 
+          'announcement', 
+          title, 
+          content, 
+          isUrgent, 
+          scheduledTime, 
+          notificationStatus, 
+          req.user.id,
+          targetScope,
+          targetPropertyId,
+          targetUsers
+        ]);
+        successCount++;
+      } catch (notifError) {
+        console.log(`Failed to create notification for user ${userId}:`, notifError.message);
+      }
+    }
+    
+    if (req.user.id) {
+      try {
+        await client.query(`
+          INSERT INTO user_activity_log 
+          (user_id, activity_type, activity_description, activity_timestamp)
+          VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+        `, [
+          req.user.id,
+          'announcement_created',
+          send_now ? `Created announcement: ${title}` : `Scheduled announcement: ${title} for ${scheduled_for}`
+        ]);
+      } catch (logError) {
+        console.log('Could not log activity:', logError.message);
+      }
+    }
+    
+    await client.query('COMMIT');
+    
+    res.status(201).json({
+      status: 201,
+      message: send_now ? 'Announcement sent successfully' : 'Announcement scheduled successfully',
+      data: {
+        title,
+        recipientCount: successCount,
+        status: notificationStatus,
+        scheduledFor: scheduledTime,
+        targetScope,
+        targetPropertyId,
+        timestamp: new Date().toISOString()
+      }
+    });
+    
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('❌ Error creating announcement:', error);
+    res.status(500).json({
+      status: 500,
+      message: 'Failed to create announcement',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// Process scheduled announcements (should be called by a cron job)
+router.post('/announcements/process-scheduled', authenticateTokenSimple, async (req, res) => {
+  console.log('⏰ Processing scheduled announcements');
+  
+  if (!['Admin', 'Super Admin'].includes(req.user.role)) {
+    return res.status(403).json({
+      status: 403,
+      message: 'Only administrators can process scheduled announcements'
+    });
+  }
+  
+  const client = await pool.connect();
+  
+  try {
+    const updateQuery = `
+      UPDATE user_notifications
+      SET status = 'sent'
+      WHERE status = 'scheduled'
+      AND scheduled_for <= CURRENT_TIMESTAMP
+      RETURNING id, user_id, title
+    `;
+    
+    const result = await client.query(updateQuery);
+    
+    res.status(200).json({
+      status: 200,
+      message: 'Scheduled announcements processed',
+      data: {
+        processedCount: result.rows.length,
+        announcements: result.rows
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Error processing scheduled announcements:', error);
+    res.status(500).json({
+      status: 500,
+      message: 'Failed to process scheduled announcements',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  } finally {
+    client.release();
+  }
+});
   
   // Get available recipients for messages (FIXED)
   router.get('/recipients', authenticateTokenSimple, async (req, res) => {
