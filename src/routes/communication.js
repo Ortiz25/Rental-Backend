@@ -736,7 +736,8 @@ router.post('/announcements', authenticateTokenSimple, async (req, res) => {
       scheduled_for = null,
       send_now = true
     } = req.body;
-    
+
+    console.log(req.body)
     if (!title || !content) {
       return res.status(400).json({
         status: 400,
@@ -798,7 +799,7 @@ router.post('/announcements', authenticateTokenSimple, async (req, res) => {
     const scheduledTime = send_now ? null : scheduled_for;
     
     // Determine target scope and property ID for metadata
-    const targetScope = recipients === 'all' ? 'all_tenants' : 'property_specific';
+   const targetScope = recipients === 'all' ? 'system_wide' : 'property_wide';
     const targetPropertyId = (recipients === 'property' && property_id) ? property_id : null;
     
     let successCount = 0;

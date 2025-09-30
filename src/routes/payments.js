@@ -297,7 +297,7 @@ router.put('/:id/process', authenticateTokenSimple, async (req, res) => {
       notes,
       processed_by 
     } = req.body;
-    
+     console.log(req.body, id)
     // Validate required fields
     if (!amount_paid || !payment_method) {
       return res.status(400).json({
