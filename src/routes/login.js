@@ -6,18 +6,34 @@ import bcrypt from "bcrypt"
 
 const router = express.Router();
 
+const getLoginRateLimit = async () => {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `SELECT setting_value FROM system_settings WHERE setting_key = 'max_login_attempts'`
+    );
+    return parseInt(result.rows[0]?.setting_value || '5');
+  } catch (error) {
+    return 5; // Default fallback
+  } finally {
+    client.release();
+  }
+};
+
+
 // Rate limiting for login attempts
 const loginLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 15, // Limit each IP to 5 requests per windowMs
-    message: {
-      status: 429,
-      message: 'Too many login attempts, please try again later.'
-    },
-    standardHeaders: true,
-    legacyHeaders: false,
-  });
-
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: async (req, res) => {
+    return await getLoginRateLimit();
+  },
+  message: {
+    status: 429,
+    message: 'Too many login attempts, please try again later.'
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 
 
@@ -188,7 +204,7 @@ router.post('/', loginLimiter, async (req, res) => {
       );
   
       // Generate JWT token
-      const token = generateToken(user);
+      const token = await generateToken(user);
   
       // Create session record
       await createUserSession(user.id, token, req);

@@ -3,12 +3,39 @@ import jwt from 'jsonwebtoken';
 
 
 
+const detectDeviceType = (userAgent) => {
+  if (!userAgent) return 'other';
+  
+  const ua = userAgent.toLowerCase();
+  
+  if (ua.includes('mobile') || ua.includes('android') || ua.includes('iphone')) {
+    return 'mobile';
+  }
+  if (ua.includes('tablet') || ua.includes('ipad')) {
+    return 'tablet';
+  }
+  if (ua.includes('electron')) {
+    return 'desktop';
+  }
+  
+  return 'web';
+};
 
 
 
 
-
-export const generateToken = (user) => {
+export const generateToken = async (user) => {
+  const client = await pool.connect();
+  
+  try {
+    // Query session timeout from system_settings
+    const settingsResult = await client.query(
+      `SELECT setting_value FROM system_settings WHERE setting_key = 'session_timeout_minutes'`
+    );
+    
+    const sessionTimeoutMinutes = settingsResult.rows[0]?.setting_value || '60';
+    const expiresIn = `${sessionTimeoutMinutes}m`;
+    console.log("Expires-In", expiresIn)
     const payload = {
       id: user.id,
       email: user.email,
@@ -18,11 +45,14 @@ export const generateToken = (user) => {
     };
     
     return jwt.sign(payload, process.env.JWT_SECRET, {
-      expiresIn: process.env.JWT_EXPIRES_IN || '24h',
+      expiresIn: expiresIn,
       issuer: 'rental-management-system',
       audience: 'rms-users'
     });
-  };
+  } finally {
+    client.release();
+  }
+};
   
   // Helper function to check if account is locked
  export const isAccountLocked = (user) => {
@@ -100,10 +130,20 @@ export const generateToken = (user) => {
   };
   
   // Helper function to create user session
-  export const createUserSession = async (userId, sessionToken, req) => {
+  export const createUserSession = async (userId, token, req) => {
     const client = await pool.connect();
+    
     try {
-      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+      // Get session timeout from system_settings
+      const settingsResult = await client.query(
+        `SELECT setting_value FROM system_settings WHERE setting_key = 'session_timeout_minutes'`
+      );
+      
+      const sessionTimeoutMinutes = parseInt(settingsResult.rows[0]?.setting_value || '60');
+      
+      // Calculate expiration times based on session timeout setting
+      const expiresAt = new Date(Date.now() + sessionTimeoutMinutes * 60 * 1000);
+      const refreshExpiresAt = new Date(Date.now() + (sessionTimeoutMinutes * 2) * 60 * 1000);
       
       // Get user agent and truncate if necessary
       const userAgent = req.headers['user-agent'] || 'Unknown Browser';
@@ -119,27 +159,32 @@ export const generateToken = (user) => {
                        (req.connection?.socket ? req.connection.socket.remoteAddress : null) ||
                        '127.0.0.1';
   
+      // Detect device type
+      const deviceType = detectDeviceType(userAgent);
+  
       await client.query(
         `INSERT INTO user_sessions 
-         (user_id, session_token, device_info, ip_address, user_agent, expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
+         (user_id, session_token, device_info, device_type, ip_address, user_agent, expires_at, refresh_expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
         [
           userId,
-          sessionToken,
-          deviceInfo, // This should be shorter than user_agent
+          token,  // This is now the resolved JWT string from generateToken
+          deviceInfo,
+          deviceType,
           ipAddress,
-          truncatedUserAgent, // Truncated to fit in column
-          expiresAt
+          truncatedUserAgent,
+          expiresAt,
+          refreshExpiresAt
         ]
       );
     } catch (error) {
       console.error('Error creating user session:', error);
-      throw error; // Re-throw to handle in calling function
+      throw error;
     } finally {
       client.release();
     }
   };
-
+  
   const getDeviceInfo = (userAgent) => {
     if (!userAgent || userAgent === 'Unknown Browser') {
       return 'Unknown Device';

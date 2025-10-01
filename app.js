@@ -24,6 +24,7 @@ import rentCollectionRoutes from "./src/routes/rentCollectionRoutes.js"
 import paymentVerificationRoutes from "./src/routes/paymentVerificatioRoutes.js"
 import docmentRoutes from "./src/routes/documents.js"
 import paymentMethodsRoutes from "./src/routes/paymentMethods.js"
+import systemSettingsRoutes from "./src/routes/systemSettings.js"
 
 const app = express();
 
@@ -59,6 +60,7 @@ app.use('/api/rent', rentCollectionRoutes);
 app.use('/api/payment-verification', paymentVerificationRoutes)
 app.use('/api/documents', docmentRoutes)
 app.use('/api/payment-methods', paymentMethodsRoutes)
+app.use('/api/system-settings', systemSettingsRoutes)
 
 
 
