@@ -21,11 +21,17 @@ router.get("/", authenticateTokenSimple, async (req, res) => {
     const {
       status = "all",
       search = "",
-      month = new Date().getMonth() + 1,
-      year = new Date().getFullYear(),
-      page = 1,
-      limit = 10,
+      month: monthParam,
+      year: yearParam,
+      page: pageParam = "1",
+      limit: limitParam = "10",
     } = req.query;
+
+    // Parse numbers properly
+    const month = parseInt(monthParam) || new Date().getMonth() + 1;
+    const year = parseInt(yearParam) || new Date().getFullYear();
+    const page = parseInt(pageParam) || 1;
+    const limit = parseInt(limitParam) || 10;
 
     const offset = (page - 1) * limit;
 
@@ -87,15 +93,19 @@ router.get("/", authenticateTokenSimple, async (req, res) => {
     queryParams.push(limit, offset);
 
     const countQuery = `
-      SELECT COUNT(*) as total
-      FROM utility_charges uc
-      JOIN leases l ON uc.lease_id = l.id
-      JOIN lease_tenants lt ON l.id = lt.lease_id AND lt.removed_date IS NULL
-      JOIN tenants t ON lt.tenant_id = t.id
-      JOIN units u ON l.unit_id = u.id
-      JOIN properties p ON u.property_id = p.id
-      WHERE ${whereClause}
-    `;
+    SELECT COUNT(*) as total
+    FROM utility_charges uc
+    JOIN leases l ON uc.lease_id = l.id
+    JOIN lease_tenants lt ON l.id = lt.lease_id AND lt.removed_date IS NULL AND lt.is_primary_tenant = true
+    JOIN tenants t ON lt.tenant_id = t.id
+    JOIN units u ON l.unit_id = u.id
+    JOIN properties p ON u.property_id = p.id
+    WHERE ${whereClause}
+  `;
+//     console.log('🔍 DEBUG INFO:');
+// console.log('Page:', page, 'Limit:', limit, 'Offset:', offset);
+// console.log('Query params:', queryParams);
+// console.log('Month:', month, 'Year:', year, 'Status:', status);
 
     const [result, countResult] = await Promise.all([
       client.query(query, queryParams),
@@ -105,15 +115,18 @@ router.get("/", authenticateTokenSimple, async (req, res) => {
     const totalCount = parseInt(countResult.rows[0].total);
     const totalPages = Math.ceil(totalCount / limit);
 
+//     console.log('📊 Results found:', result.rows.length);
+// console.log('🔍 Actual SQL executed:', query);
+
     res.status(200).json({
       status: 200,
       message: "Utility charges retrieved successfully",
       data: result.rows,
       pagination: {
-        currentPage: parseInt(page),
+        currentPage: page,
         totalPages,
         totalCount,
-        limit: parseInt(limit),
+        limit,
       },
     });
   } catch (error) {
@@ -134,9 +147,12 @@ router.get("/summary", authenticateTokenSimple, async (req, res) => {
 
   try {
     const {
-      month = new Date().getMonth() + 1,
-      year = new Date().getFullYear(),
+      month: monthParam,
+      year: yearParam,
     } = req.query;
+
+    const month = parseInt(monthParam) || new Date().getMonth() + 1;
+    const year = parseInt(yearParam) || new Date().getFullYear();
 
     const query = `
       SELECT 
@@ -200,9 +216,10 @@ router.post("/", authenticateTokenSimple, async (req, res) => {
       other_charges = 0,
       other_charges_description,
       due_date,
-      charge_status = "pending", // ADD THIS LINE
+      charge_status = "pending",
       notes,
     } = req.body;
+
     if (!lease_id || !billing_month) {
       return res.status(400).json({
         status: 400,
@@ -214,15 +231,15 @@ router.post("/", authenticateTokenSimple, async (req, res) => {
     await client.query("BEGIN");
 
     const query = `
-  INSERT INTO utility_charges (
-    lease_id, billing_month, water_charges, water_usage,
-    electricity_charges, electricity_usage, gas_charges,
-    service_charges, garbage_charges, common_area_charges,
-    other_charges, other_charges_description, due_date,
-    notes, charge_status, created_by
-  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-  RETURNING *
-`;
+      INSERT INTO utility_charges (
+        lease_id, billing_month, water_charges, water_usage,
+        electricity_charges, electricity_usage, gas_charges,
+        service_charges, garbage_charges, common_area_charges,
+        other_charges, other_charges_description, due_date,
+        notes, charge_status, created_by
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+      RETURNING *
+    `;
 
     const result = await client.query(query, [
       lease_id,
@@ -240,7 +257,7 @@ router.post("/", authenticateTokenSimple, async (req, res) => {
       due_date,
       notes,
       charge_status,
-      req.user.username, // charge_status now comes from request
+      req.user.username,
     ]);
 
     await client.query("COMMIT");
@@ -388,58 +405,58 @@ router.delete("/:id", authenticateTokenSimple, async (req, res) => {
 
 // Bill utilities to rent payments
 router.post('/bill-to-rent', authenticateTokenSimple, async (req, res) => {
-    const client = await pool.connect();
-    
-    try {
-      const allowedRoles = ['Super Admin', 'Admin', 'Manager'];
-      if (!allowedRoles.includes(req.user.role)) {
-        return res.status(403).json({
-          status: 403,
-          message: 'Access denied',
-          data: null
-        });
-      }
+  const client = await pool.connect();
   
-      const { month, year } = req.body;
-  
-      if (!month || !year) {
-        return res.status(400).json({
-          status: 400,
-          message: 'Month and year are required',
-          data: null
-        });
-      }
-  
-      await client.query('BEGIN');
-  
-      const query = `SELECT * FROM bill_utilities_to_rent($1, $2)`;
-      const result = await client.query(query, [month, year]);
-  
-      await client.query('COMMIT');
-  
-      const billedCount = result.rows.length;
-  
-      res.status(200).json({
-        status: 200,
-        message: `Successfully billed ${billedCount} utility charges to rent payments`,
-        data: {
-          billed_count: billedCount,
-          details: result.rows
-        }
+  try {
+    const allowedRoles = ['Super Admin', 'Admin', 'Manager'];
+    if (!allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({
+        status: 403,
+        message: 'Access denied',
+        data: null
       });
-  
-    } catch (error) {
-      await client.query('ROLLBACK');
-      console.error('Error billing utilities to rent:', error);
-      res.status(500).json({
-        status: 500,
-        message: 'Failed to bill utilities to rent',
-        error: process.env.NODE_ENV === 'development' ? error.message : undefined
-      });
-    } finally {
-      client.release();
     }
-  });
+
+    const { month, year } = req.body;
+
+    if (!month || !year) {
+      return res.status(400).json({
+        status: 400,
+        message: 'Month and year are required',
+        data: null
+      });
+    }
+
+    await client.query('BEGIN');
+
+    const query = `SELECT * FROM bill_utilities_to_rent($1, $2)`;
+    const result = await client.query(query, [month, year]);
+
+    await client.query('COMMIT');
+
+    const billedCount = result.rows.length;
+
+    res.status(200).json({
+      status: 200,
+      message: `Successfully billed ${billedCount} utility charges to rent payments`,
+      data: {
+        billed_count: billedCount,
+        details: result.rows
+      }
+    });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error billing utilities to rent:', error);
+    res.status(500).json({
+      status: 500,
+      message: 'Failed to bill utilities to rent',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  } finally {
+    client.release();
+  }
+});
 
 // Bulk generate utility charges for active leases
 router.post("/generate", authenticateTokenSimple, async (req, res) => {
