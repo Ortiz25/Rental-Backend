@@ -101,12 +101,12 @@ router.get(
         l.lease_number,
         l.monthly_rent,
         -- Calculate current balance for context
-        COALESCE((
-          SELECT SUM(rp.amount_due - rp.amount_paid)
-          FROM rent_payments rp
-          WHERE rp.lease_id = ps.lease_id 
-          AND rp.payment_status IN ('pending', 'overdue')
-        ), 0) as current_balance,
+COALESCE((
+  SELECT SUM(rp.amount_due + COALESCE(rp.utilities_charges, 0) - rp.amount_paid)
+  FROM rent_payments rp
+  WHERE rp.lease_id = ps.lease_id 
+  AND rp.payment_status IN ('pending', 'overdue')
+), 0) as current_balance,
         -- Time since submission for urgency
         EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - ps.submission_date))/3600 as hours_since_submission
       FROM payment_submissions ps
@@ -392,11 +392,11 @@ router.get(
         l.end_date as lease_end,
         -- Current balance
         COALESCE((
-          SELECT SUM(rp.amount_due - rp.amount_paid)
-          FROM rent_payments rp
-          WHERE rp.lease_id = ps.lease_id 
-          AND rp.payment_status IN ('pending', 'overdue')
-        ), 0) as current_balance,
+  SELECT SUM(rp.amount_due + COALESCE(rp.utilities_charges, 0) - rp.amount_paid)
+  FROM rent_payments rp
+  WHERE rp.lease_id = ps.lease_id 
+  AND rp.payment_status IN ('pending', 'overdue')
+), 0) as current_balance,
         -- Recent payments
         (
           SELECT json_agg(
@@ -460,26 +460,33 @@ router.get(
 
 // Verify payment submission
 
-router.put('/payment-submissions/:id/verify', authenticateTokenSimple, async (req, res) => {
-  const client = await pool.connect();
-  
-  try {
-    const submissionId = req.params.id;
-    const { admin_notes, verified_amount, apply_to_account = true } = req.body;
+router.put(
+  "/payment-submissions/:id/verify",
+  authenticateTokenSimple,
+  async (req, res) => {
+    const client = await pool.connect();
 
-    // ✅ IMPROVED: Enhanced validation
-    if (!admin_notes?.trim()) {
-      return res.status(400).json({
-        status: 400,
-        message: 'Admin notes are required for verification',
-        data: null
-      });
-    }
+    try {
+      const submissionId = req.params.id;
+      const {
+        admin_notes,
+        verified_amount,
+        apply_to_account = true,
+      } = req.body;
 
-    await client.query('BEGIN');
+      // ✅ IMPROVED: Enhanced validation
+      if (!admin_notes?.trim()) {
+        return res.status(400).json({
+          status: 400,
+          message: "Admin notes are required for verification",
+          data: null,
+        });
+      }
 
-    // ✅ IMPROVED: Get detailed submission info with validation
-    const submissionQuery = `
+      await client.query("BEGIN");
+
+      // ✅ IMPROVED: Get detailed submission info with validation
+      const submissionQuery = `
       SELECT 
         ps.*,
         l.lease_number,
@@ -494,10 +501,10 @@ router.put('/payment-submissions/:id/verify', authenticateTokenSimple, async (re
          WHERE rp.lease_id = ps.lease_id 
          AND rp.payment_status IN ('pending', 'overdue')) as pending_payments_count,
         -- Get total amount due
-        (SELECT COALESCE(SUM(rp.amount_due - rp.amount_paid), 0) 
-         FROM rent_payments rp 
-         WHERE rp.lease_id = ps.lease_id 
-         AND rp.payment_status IN ('pending', 'overdue')) as total_amount_due
+        (SELECT COALESCE(SUM(rp.amount_due + COALESCE(rp.utilities_charges, 0) - rp.amount_paid), 0) 
+ FROM rent_payments rp 
+ WHERE rp.lease_id = ps.lease_id 
+ AND rp.payment_status IN ('pending', 'overdue')) as total_amount_due
       FROM payment_submissions ps
       JOIN tenants t ON ps.tenant_id = t.id
       JOIN leases l ON ps.lease_id = l.id
@@ -506,61 +513,66 @@ router.put('/payment-submissions/:id/verify', authenticateTokenSimple, async (re
       WHERE ps.id = $1 AND ps.verification_status = 'pending'
     `;
 
-    const submissionResult = await client.query(submissionQuery, [submissionId]);
+      const submissionResult = await client.query(submissionQuery, [
+        submissionId,
+      ]);
 
-    if (submissionResult.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({
-        status: 404,
-        message: 'Payment submission not found or already processed',
-        data: null
-      });
-    }
+      if (submissionResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({
+          status: 404,
+          message: "Payment submission not found or already processed",
+          data: null,
+        });
+      }
 
-    const submission = submissionResult.rows[0];
+      const submission = submissionResult.rows[0];
 
-    // ✅ IMPROVED: Pre-verification validations
-    if (submission.lease_status !== 'active') {
-      await client.query('ROLLBACK');
-      return res.status(400).json({
-        status: 400,
-        message: `Cannot verify payment for ${submission.lease_status} lease`,
-        data: null
-      });
-    }
+      // ✅ IMPROVED: Pre-verification validations
+      if (submission.lease_status !== "active") {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          status: 400,
+          message: `Cannot verify payment for ${submission.lease_status} lease`,
+          data: null,
+        });
+      }
 
-    if (submission.is_blacklisted && submission.blacklist_severity === 'severe') {
-      await client.query('ROLLBACK');
-      return res.status(400).json({
-        status: 400,
-        message: 'Cannot verify payment for severely blacklisted tenant',
-        data: null
-      });
-    }
+      if (
+        submission.is_blacklisted &&
+        submission.blacklist_severity === "severe"
+      ) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          status: 400,
+          message: "Cannot verify payment for severely blacklisted tenant",
+          data: null,
+        });
+      }
 
-    if (submission.pending_payments_count === 0) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({
-        status: 400,
-        message: 'No pending payments found for this lease',
-        data: null
-      });
-    }
+      if (submission.pending_payments_count === 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          status: 400,
+          message: "No pending payments found for this lease",
+          data: null,
+        });
+      }
 
-    const amountToVerify = verified_amount || submission.amount;
+      const amountToVerify = verified_amount || submission.amount;
 
-    // ✅ IMPROVED: Amount validation
-    if (amountToVerify <= 0 || amountToVerify > submission.amount) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({
-        status: 400,
-        message: 'Invalid verified amount',
-        data: null
-      });
-    }
+      // ✅ IMPROVED: Amount validation
+      if (amountToVerify <= 0 || amountToVerify > submission.amount) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          status: 400,
+          message: "Invalid verified amount",
+          data: null,
+        });
+      }
 
-    // ✅ IMPROVED: Check for duplicate verification attempts
-    const duplicateCheck = `
+      // ✅ IMPROVED: Check for duplicate verification attempts
+      const duplicateCheck = `
       SELECT COUNT(*) as count
       FROM payment_submissions 
       WHERE tenant_id = $1 
@@ -569,23 +581,23 @@ router.put('/payment-submissions/:id/verify', authenticateTokenSimple, async (re
       AND id != $3
     `;
 
-    const duplicateResult = await client.query(duplicateCheck, [
-      submission.tenant_id,
-      submission.transaction_reference,
-      submissionId
-    ]);
+      const duplicateResult = await client.query(duplicateCheck, [
+        submission.tenant_id,
+        submission.transaction_reference,
+        submissionId,
+      ]);
 
-    if (parseInt(duplicateResult.rows[0].count) > 0) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({
-        status: 400,
-        message: 'Duplicate transaction reference already verified',
-        data: null
-      });
-    }
+      if (parseInt(duplicateResult.rows[0].count) > 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          status: 400,
+          message: "Duplicate transaction reference already verified",
+          data: null,
+        });
+      }
 
-    // ✅ IMPROVED: Update submission with better tracking
-    const updateSubmissionQuery = `
+      // ✅ IMPROVED: Update submission with better tracking
+      const updateSubmissionQuery = `
       UPDATE payment_submissions 
       SET 
         verification_status = 'verified',
@@ -597,14 +609,14 @@ router.put('/payment-submissions/:id/verify', authenticateTokenSimple, async (re
       RETURNING *
     `;
 
-    const updateResult = await client.query(updateSubmissionQuery, [
-      req.user.id,
-      admin_notes.trim(),
-      submissionId
-    ]);
+      const updateResult = await client.query(updateSubmissionQuery, [
+        req.user.id,
+        admin_notes.trim(),
+        submissionId,
+      ]);
 
-    // ✅ IMPROVED: Enhanced activity logging
-    const logQuery = `
+      // ✅ IMPROVED: Enhanced activity logging
+      const logQuery = `
       INSERT INTO user_activity_log (
         user_id, 
         activity_type, 
@@ -615,62 +627,68 @@ router.put('/payment-submissions/:id/verify', authenticateTokenSimple, async (re
       ) VALUES ($1, $2, $3, $4, $5, $6)
     `;
 
-    await client.query(logQuery, [
-      req.user.id,
-      'payment_verified',
-      `Verified payment submission of $${amountToVerify} from ${submission.tenant_name} (${submission.transaction_reference})`,
-      'payment_submission',
-      submissionId,
-      JSON.stringify({
-        tenant_name: submission.tenant_name,
-        property_unit: submission.property_unit,
-        transaction_reference: submission.transaction_reference,
-        amount: amountToVerify,
-        lease_number: submission.lease_number
-      })
-    ]);
+      await client.query(logQuery, [
+        req.user.id,
+        "payment_verified",
+        `Verified payment submission of $${amountToVerify} from ${submission.tenant_name} (${submission.transaction_reference})`,
+        "payment_submission",
+        submissionId,
+        JSON.stringify({
+          tenant_name: submission.tenant_name,
+          property_unit: submission.property_unit,
+          transaction_reference: submission.transaction_reference,
+          amount: amountToVerify,
+          lease_number: submission.lease_number,
+        }),
+      ]);
 
-    await client.query('COMMIT');
+      await client.query("COMMIT");
 
-    console.log(`✅ Payment submission ${submissionId} verified successfully by ${req.user.username}`);
+      console.log(
+        `✅ Payment submission ${submissionId} verified successfully by ${req.user.username}`
+      );
 
-    // ✅ IMPROVED: Return comprehensive response
-    res.status(200).json({
-      status: 200,
-      message: 'Payment submission verified successfully',
-      data: {
-        ...updateResult.rows[0],
-        verified_amount: amountToVerify,
-        tenant_name: submission.tenant_name,
-        property_unit: submission.property_unit,
-        total_amount_due: submission.total_amount_due,
-        pending_payments_count: submission.pending_payments_count
-      }
-    });
+      // ✅ IMPROVED: Return comprehensive response
+      res.status(200).json({
+        status: 200,
+        message: "Payment submission verified successfully",
+        data: {
+          ...updateResult.rows[0],
+          verified_amount: amountToVerify,
+          tenant_name: submission.tenant_name,
+          property_unit: submission.property_unit,
+          total_amount_due: submission.total_amount_due,
+          pending_payments_count: submission.pending_payments_count,
+        },
+      });
 
-    // Note: Database trigger automatically handles rent_payments table updates
-
-  } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('❌ Error verifying payment submission:', error);
-    res.status(500).json({
-      status: 500,
-      message: 'Failed to verify payment submission',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  } finally {
-    client.release();
+      // Note: Database trigger automatically handles rent_payments table updates
+    } catch (error) {
+      await client.query("ROLLBACK");
+      console.error("❌ Error verifying payment submission:", error);
+      res.status(500).json({
+        status: 500,
+        message: "Failed to verify payment submission",
+        error:
+          process.env.NODE_ENV === "development" ? error.message : undefined,
+      });
+    } finally {
+      client.release();
+    }
   }
-});
+);
 
-router.get('/payment-submissions/:id/application-result', authenticateTokenSimple, async (req, res) => {
-  const client = await pool.connect();
-  
-  try {
-    const submissionId = req.params.id;
+router.get(
+  "/payment-submissions/:id/application-result",
+  authenticateTokenSimple,
+  async (req, res) => {
+    const client = await pool.connect();
 
-    // Get the application result after verification
-    const resultQuery = `
+    try {
+      const submissionId = req.params.id;
+
+      // Get the application result after verification
+      const resultQuery = `
       SELECT 
         ps.id as submission_id,
         ps.amount as submitted_amount,
@@ -698,119 +716,127 @@ router.get('/payment-submissions/:id/application-result', authenticateTokenSimpl
       WHERE ps.id = $1
     `;
 
-    const result = await client.query(resultQuery, [submissionId]);
+      const result = await client.query(resultQuery, [submissionId]);
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        status: 404,
-        message: 'Payment submission not found',
-        data: null
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          status: 404,
+          message: "Payment submission not found",
+          data: null,
+        });
+      }
+
+      res.status(200).json({
+        status: 200,
+        message: "Payment application result retrieved successfully",
+        data: result.rows[0],
       });
+    } catch (error) {
+      console.error("❌ Error fetching application result:", error);
+      res.status(500).json({
+        status: 500,
+        message: "Failed to fetch payment application result",
+        error:
+          process.env.NODE_ENV === "development" ? error.message : undefined,
+      });
+    } finally {
+      client.release();
     }
-
-    res.status(200).json({
-      status: 200,
-      message: 'Payment application result retrieved successfully',
-      data: result.rows[0]
-    });
-
-  } catch (error) {
-    console.error('❌ Error fetching application result:', error);
-    res.status(500).json({
-      status: 500,
-      message: 'Failed to fetch payment application result',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  } finally {
-    client.release();
   }
-});
+);
 
 // ✅ NEW: Manual rent payment application (for edge cases)
-router.post('/payment-submissions/:id/manual-apply', authenticateTokenSimple, async (req, res) => {
-  const client = await pool.connect();
-  
-  try {
-    const allowedRoles = ['Super Admin', 'Admin'];
-    if (!allowedRoles.includes(req.user.role)) {
-      return res.status(403).json({
-        status: 403,
-        message: 'Access denied. Super Admin or Admin role required.',
-        data: null
-      });
-    }
+router.post(
+  "/payment-submissions/:id/manual-apply",
+  authenticateTokenSimple,
+  async (req, res) => {
+    const client = await pool.connect();
 
-    const submissionId = req.params.id;
-    const { rent_payment_id, apply_amount, notes } = req.body;
+    try {
+      const allowedRoles = ["Super Admin", "Admin"];
+      if (!allowedRoles.includes(req.user.role)) {
+        return res.status(403).json({
+          status: 403,
+          message: "Access denied. Super Admin or Admin role required.",
+          data: null,
+        });
+      }
 
-    if (!rent_payment_id || !apply_amount || apply_amount <= 0) {
-      return res.status(400).json({
-        status: 400,
-        message: 'Valid rent payment ID and amount are required',
-        data: null
-      });
-    }
+      const submissionId = req.params.id;
+      const { rent_payment_id, apply_amount, notes } = req.body;
 
-    await client.query('BEGIN');
+      if (!rent_payment_id || !apply_amount || apply_amount <= 0) {
+        return res.status(400).json({
+          status: 400,
+          message: "Valid rent payment ID and amount are required",
+          data: null,
+        });
+      }
 
-    // Get submission details
-    const submissionQuery = `
+      await client.query("BEGIN");
+
+      // Get submission details
+      const submissionQuery = `
       SELECT ps.*, l.lease_number
       FROM payment_submissions ps
       JOIN leases l ON ps.lease_id = l.id
       WHERE ps.id = $1 AND ps.verification_status = 'verified'
     `;
 
-    const submissionResult = await client.query(submissionQuery, [submissionId]);
+      const submissionResult = await client.query(submissionQuery, [
+        submissionId,
+      ]);
 
-    if (submissionResult.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({
-        status: 404,
-        message: 'Verified payment submission not found',
-        data: null
-      });
-    }
+      if (submissionResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({
+          status: 404,
+          message: "Verified payment submission not found",
+          data: null,
+        });
+      }
 
-    const submission = submissionResult.rows[0];
+      const submission = submissionResult.rows[0];
 
-    // Get rent payment details
-    const rentPaymentQuery = `
+      // Get rent payment details
+      const rentPaymentQuery = `
       SELECT * FROM rent_payments 
       WHERE id = $1 AND lease_id = $2
     `;
 
-    const rentPaymentResult = await client.query(rentPaymentQuery, [
-      rent_payment_id,
-      submission.lease_id
-    ]);
+      const rentPaymentResult = await client.query(rentPaymentQuery, [
+        rent_payment_id,
+        submission.lease_id,
+      ]);
 
-    if (rentPaymentResult.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({
-        status: 404,
-        message: 'Rent payment not found for this lease',
-        data: null
-      });
-    }
+      if (rentPaymentResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({
+          status: 404,
+          message: "Rent payment not found for this lease",
+          data: null,
+        });
+      }
 
-    const rentPayment = rentPaymentResult.rows[0];
-    const remainingDue = rentPayment.amount_due - rentPayment.amount_paid;
+      const rentPayment = rentPaymentResult.rows[0];
+      const remainingDue = rentPayment.amount_due - rentPayment.amount_paid;
 
-    if (apply_amount > remainingDue) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({
-        status: 400,
-        message: `Amount exceeds remaining due ($${remainingDue})`,
-        data: null
-      });
-    }
+      if (apply_amount > remainingDue) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          status: 400,
+          message: `Amount exceeds remaining due ($${remainingDue})`,
+          data: null,
+        });
+      }
 
-    // Apply payment manually
-    const newAmountPaid = parseFloat(rentPayment.amount_paid) + parseFloat(apply_amount);
-    const newStatus = newAmountPaid >= rentPayment.amount_due ? 'paid' : 'partial';
+      // Apply payment manually
+      const newAmountPaid =
+        parseFloat(rentPayment.amount_paid) + parseFloat(apply_amount);
+      const newStatus =
+        newAmountPaid >= rentPayment.amount_due ? "paid" : "partial";
 
-    const updateRentPaymentQuery = `
+      const updateRentPaymentQuery = `
       UPDATE rent_payments 
       SET 
         amount_paid = $1,
@@ -823,133 +849,16 @@ router.post('/payment-submissions/:id/manual-apply', authenticateTokenSimple, as
       RETURNING *
     `;
 
-    const updateResult = await client.query(updateRentPaymentQuery, [
-      newAmountPaid,
-      newStatus,
-      submission.payment_method,
-      submission.transaction_reference,
-      submission.transaction_date,
-      rent_payment_id
-    ]);
-
-    // Log manual application
-    const logQuery = `
-      INSERT INTO user_activity_log (
-        user_id, 
-        activity_type, 
-        activity_description,
-        affected_resource_type,
-        affected_resource_id
-      ) VALUES ($1, $2, $3, $4, $5)
-    `;
-
-    await client.query(logQuery, [
-      req.user.id,
-      'manual_payment_application',
-      `Manually applied $${apply_amount} from submission ${submissionId} to rent payment ${rent_payment_id}. ${notes || ''}`,
-      'rent_payment',
-      rent_payment_id
-    ]);
-
-    await client.query('COMMIT');
-
-    res.status(200).json({
-      status: 200,
-      message: 'Payment applied manually to rent payment',
-      data: {
-        rent_payment: updateResult.rows[0],
-        applied_amount: apply_amount,
-        new_status: newStatus
-      }
-    });
-
-  } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('❌ Error manually applying payment:', error);
-    res.status(500).json({
-      status: 500,
-      message: 'Failed to manually apply payment',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  } finally {
-    client.release();
-  }
-});
-
-// Reject payment submission
-router.put(
-  "/payment-submissions/:id/reject",
-  authenticateTokenSimple,
-  async (req, res) => {
-    console.log("❌ Rejecting payment submission ID:", req.params.id);
-
-    const client = await pool.connect();
-
-    try {
-      const allowedRoles = ["Super Admin", "Admin", "Manager"];
-      if (!allowedRoles.includes(req.user.role)) {
-        return res.status(403).json({
-          status: 403,
-          message:
-            "Access denied. Insufficient privileges for payment verification.",
-          data: null,
-        });
-      }
-
-      const submissionId = req.params.id;
-      const { admin_notes } = req.body;
-
-      if (!admin_notes || !admin_notes.trim()) {
-        return res.status(400).json({
-          status: 400,
-          message: "Rejection reason is required",
-          data: null,
-        });
-      }
-
-      await client.query("BEGIN");
-
-      // Check if submission exists and is pending
-      const checkQuery = `
-      SELECT ps.*, t.first_name || ' ' || t.last_name as tenant_name
-      FROM payment_submissions ps
-      JOIN tenants t ON ps.tenant_id = t.id
-      WHERE ps.id = $1 AND ps.verification_status = 'pending'
-    `;
-
-      const checkResult = await client.query(checkQuery, [submissionId]);
-
-      if (checkResult.rows.length === 0) {
-        await client.query("ROLLBACK");
-        return res.status(404).json({
-          status: 404,
-          message: "Payment submission not found or already processed",
-          data: null,
-        });
-      }
-
-      const submission = checkResult.rows[0];
-
-      // Update the submission status
-      const updateQuery = `
-      UPDATE payment_submissions 
-      SET 
-        verification_status = 'rejected',
-        verified_date = CURRENT_TIMESTAMP,
-        verified_by = $1,
-        admin_notes = $2,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = $3
-      RETURNING *
-    `;
-
-      const updateResult = await client.query(updateQuery, [
-        req.user.id,
-        admin_notes.trim(),
-        submissionId,
+      const updateResult = await client.query(updateRentPaymentQuery, [
+        newAmountPaid,
+        newStatus,
+        submission.payment_method,
+        submission.transaction_reference,
+        submission.transaction_date,
+        rent_payment_id,
       ]);
 
-      // Log the rejection activity
+      // Log manual application
       const logQuery = `
       INSERT INTO user_activity_log (
         user_id, 
@@ -962,31 +871,29 @@ router.put(
 
       await client.query(logQuery, [
         req.user.id,
-        "payment_rejected",
-        `Rejected payment submission of $${submission.amount} from ${submission.tenant_name}. Reason: ${admin_notes.trim()}`,
-        "payment_submission",
-        submissionId,
+        "manual_payment_application",
+        `Manually applied $${apply_amount} from submission ${submissionId} to rent payment ${rent_payment_id}. ${notes || ""}`,
+        "rent_payment",
+        rent_payment_id,
       ]);
 
       await client.query("COMMIT");
 
-      console.log(
-        `❌ Payment submission ${submissionId} rejected successfully`
-      );
-
       res.status(200).json({
         status: 200,
-        message: "Payment submission rejected successfully",
-        data: updateResult.rows[0],
+        message: "Payment applied manually to rent payment",
+        data: {
+          rent_payment: updateResult.rows[0],
+          applied_amount: apply_amount,
+          new_status: newStatus,
+        },
       });
-
-      // Note: The database trigger will automatically send rejection notification to tenant
     } catch (error) {
       await client.query("ROLLBACK");
-      console.error("❌ Error rejecting payment submission:", error);
+      console.error("❌ Error manually applying payment:", error);
       res.status(500).json({
         status: 500,
-        message: "Failed to reject payment submission",
+        message: "Failed to manually apply payment",
         error:
           process.env.NODE_ENV === "development" ? error.message : undefined,
       });
@@ -995,6 +902,145 @@ router.put(
     }
   }
 );
+
+// Reject payment submission
+router.put("/payment-submissions/:id/reject", authenticateTokenSimple, async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    const allowedRoles = ["Super Admin", "Admin", "Manager"];
+    if (!allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({
+        status: 403,
+        message: "Access denied. Insufficient privileges for payment verification.",
+        data: null,
+      });
+    }
+
+    const submissionId = req.params.id;
+    const { admin_notes } = req.body;
+
+    if (!admin_notes || !admin_notes.trim()) {
+      return res.status(400).json({
+        status: 400,
+        message: "Rejection reason is required",
+        data: null,
+      });
+    }
+
+    await client.query("BEGIN");
+
+    // Check if submission exists and is pending
+    const checkQuery = `
+      SELECT 
+        ps.*, 
+        t.first_name || ' ' || t.last_name as tenant_name,
+        u.id as tenant_user_id
+      FROM payment_submissions ps
+      JOIN tenants t ON ps.tenant_id = t.id
+      LEFT JOIN users u ON u.tenant_id = t.id
+      WHERE ps.id = $1 AND ps.verification_status = 'pending'
+    `;
+
+    const checkResult = await client.query(checkQuery, [submissionId]);
+
+    if (checkResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        status: 404,
+        message: "Payment submission not found or already processed",
+        data: null,
+      });
+    }
+
+    const submission = checkResult.rows[0];
+
+    // Update the submission status
+    const updateQuery = `
+      UPDATE payment_submissions 
+      SET 
+        verification_status = 'rejected',
+        verified_date = CURRENT_TIMESTAMP,
+        verified_by = $1,
+        admin_notes = $2,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $3
+      RETURNING *
+    `;
+
+    const updateResult = await client.query(updateQuery, [
+      req.user.id,
+      admin_notes.trim(),
+      submissionId,
+    ]);
+
+    // ✅ ADD THIS: Create notification for tenant
+    if (submission.tenant_user_id) {
+      const notificationQuery = `
+        INSERT INTO user_notifications (
+          user_id,
+          notification_type,
+          title,
+          message,
+          related_resource_type,
+          related_resource_id,
+          is_urgent
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `;
+
+      await client.query(notificationQuery, [
+        submission.tenant_user_id,
+        'payment_rejected',
+        'Payment Submission Rejected',
+        `Your payment submission of ${submission.amount} has been rejected. Reason: ${admin_notes.trim()}. Please contact property management for clarification.`,
+        'payment_submission',
+        submissionId,
+        true
+      ]);
+    }
+
+    // Log the rejection activity
+    const logQuery = `
+      INSERT INTO user_activity_log (
+        user_id, 
+        activity_type, 
+        activity_description,
+        affected_resource_type,
+        affected_resource_id
+      ) VALUES ($1, $2, $3, $4, $5)
+    `;
+
+    await client.query(logQuery, [
+      req.user.id,
+      "payment_rejected",
+      `Rejected payment submission of $${submission.amount} from ${submission.tenant_name}. Reason: ${admin_notes.trim()}`,
+      "payment_submission",
+      submissionId,
+    ]);
+
+    await client.query("COMMIT");
+
+    console.log(`❌ Payment submission ${submissionId} rejected successfully`);
+
+    res.status(200).json({
+      status: 200,
+      message: "Payment submission rejected successfully. Tenant has been notified.",
+      data: updateResult.rows[0],
+    });
+
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error rejecting payment submission:", error);
+    res.status(500).json({
+      status: 500,
+      message: "Failed to reject payment submission",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
+  } finally {
+    client.release();
+  }
+});
+
 
 // Bulk verify payment submissions
 router.put(
@@ -1066,7 +1112,7 @@ router.put(
       const updatePlaceholders = submission_ids
         .map((_, index) => `$${index + 3}`) // Start from $3 since $1 and $2 are used for verified_by and admin_notes
         .join(",");
-      
+
       const updateQuery = `
       UPDATE payment_submissions 
       SET 

@@ -131,6 +131,55 @@ router.get('/', authenticateTokenSimple, async (req, res) => {
   }
 });
 
+// Get active leases for utility billing (no pagination)
+router.get('/active-for-billing', authenticateTokenSimple, async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        l.id,
+        l.lease_number,
+        l.monthly_rent,
+        l.start_date,
+        l.end_date,
+        l.rent_due_day,
+        p.property_name,
+        u.unit_number,
+        STRING_AGG(
+          CASE WHEN lt.is_primary_tenant = true 
+          THEN t.first_name || ' ' || t.last_name END, 
+          ', '
+        ) as primary_tenant_name,
+        STRING_AGG(
+          CASE WHEN lt.is_primary_tenant = true THEN t.email END, 
+          ', '
+        ) as primary_tenant_email
+      FROM leases l
+      JOIN units u ON l.unit_id = u.id
+      JOIN properties p ON u.property_id = p.id
+      LEFT JOIN lease_tenants lt ON l.id = lt.lease_id AND lt.removed_date IS NULL
+      LEFT JOIN tenants t ON lt.tenant_id = t.id
+      WHERE l.lease_status = 'active'
+      GROUP BY l.id, p.property_name, u.unit_number
+      ORDER BY p.property_name, u.unit_number
+    `;
+    
+    const result = await pool.query(query);
+    
+    res.json({
+      success: true,
+      data: result.rows
+    });
+    
+  } catch (error) {
+    console.error('Error fetching active leases for billing:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching active leases',
+      error: error.message
+    });
+  }
+});
+
 // Get single lease by ID with detailed information
 router.get('/:id', authenticateTokenSimple, async (req, res) => {
   try {

@@ -5,6 +5,7 @@ import { authenticateTokenSimple } from '../middleware/auth.js';
 const router = express.Router();
 
 // Get all rent payments with filtering and pagination
+// Get all rent payments with filtering and pagination
 router.get('/', authenticateTokenSimple, async (req, res) => {
   try {
     const { 
@@ -24,6 +25,7 @@ router.get('/', authenticateTokenSimple, async (req, res) => {
         rp.due_date,
         rp.amount_due,
         rp.amount_paid,
+        rp.utilities_charges,
         rp.payment_method,
         rp.payment_reference,
         rp.late_fee,
@@ -58,12 +60,37 @@ router.get('/', authenticateTokenSimple, async (req, res) => {
           ', '
         ) as tenant_phone,
         
+        -- Get utility breakdown
+        (
+          SELECT json_build_object(
+            'water_charges', uc.water_charges,
+            'electricity_charges', uc.electricity_charges,
+            'gas_charges', uc.gas_charges,
+            'service_charges', uc.service_charges,
+            'garbage_charges', uc.garbage_charges,
+            'common_area_charges', uc.common_area_charges,
+            'other_charges', uc.other_charges,
+            'other_charges_description', uc.other_charges_description,
+            'total_utility_charges', uc.total_utility_charges,
+            'billing_month', uc.billing_month,
+            'charge_status', uc.charge_status
+          )
+          FROM utility_charges uc
+          WHERE uc.lease_id = rp.lease_id
+          AND DATE_TRUNC('month', uc.billing_month) = DATE_TRUNC('month', rp.due_date)
+          AND uc.charge_status = 'billed'
+          LIMIT 1
+        ) as utility_breakdown,
+        
         -- Calculate days overdue
         CASE 
           WHEN rp.payment_status = 'overdue' THEN 
             CURRENT_DATE - rp.due_date - l.grace_period_days
           ELSE 0
         END as days_overdue,
+        
+        -- Calculate total amount due including utilities
+        (rp.amount_due + COALESCE(rp.utilities_charges, 0) + COALESCE(rp.late_fee, 0)) as total_amount_due,
         
         -- Invoice number (generated)
         CONCAT('INV-', EXTRACT(YEAR FROM rp.due_date), '-', LPAD(rp.id::text, 4, '0')) as invoice_number
@@ -183,11 +210,12 @@ router.get('/summary', authenticateTokenSimple, async (req, res) => {
     const summaryQuery = `
       SELECT 
         COUNT(*) as total_payments,
-        SUM(rp.amount_due + COALESCE(rp.late_fee, 0)) as total_due,
+        SUM(rp.amount_due + COALESCE(rp.utilities_charges, 0) + COALESCE(rp.late_fee, 0)) as total_due,
         SUM(CASE WHEN rp.payment_status = 'paid' THEN rp.amount_paid ELSE 0 END) as total_collected,
-        SUM(CASE WHEN rp.payment_status = 'pending' THEN rp.amount_due ELSE 0 END) as total_pending,
-        SUM(CASE WHEN rp.payment_status = 'overdue' THEN rp.amount_due + COALESCE(rp.late_fee, 0) ELSE 0 END) as total_overdue,
+        SUM(CASE WHEN rp.payment_status = 'pending' THEN rp.amount_due + COALESCE(rp.utilities_charges, 0) ELSE 0 END) as total_pending,
+        SUM(CASE WHEN rp.payment_status = 'overdue' THEN rp.amount_due + COALESCE(rp.utilities_charges, 0) + COALESCE(rp.late_fee, 0) ELSE 0 END) as total_overdue,
         SUM(COALESCE(rp.late_fee, 0)) as total_late_fees,
+        SUM(COALESCE(rp.utilities_charges, 0)) as total_utilities,
         COUNT(CASE WHEN rp.payment_status = 'paid' THEN 1 END) as paid_count,
         COUNT(CASE WHEN rp.payment_status = 'pending' THEN 1 END) as pending_count,
         COUNT(CASE WHEN rp.payment_status = 'overdue' THEN 1 END) as overdue_count,
@@ -218,6 +246,7 @@ router.get('/summary', authenticateTokenSimple, async (req, res) => {
 });
 
 // Get single rent payment by ID
+// Get single rent payment by ID
 router.get('/:id', authenticateTokenSimple, async (req, res) => {
   try {
     const { id } = req.params;
@@ -231,6 +260,31 @@ router.get('/:id', authenticateTokenSimple, async (req, res) => {
         p.property_name,
         u.unit_number,
         CONCAT(p.property_name, ', Unit ', u.unit_number) as property_unit,
+        
+        -- Get utility breakdown
+        (
+          SELECT json_build_object(
+            'water_charges', uc.water_charges,
+            'electricity_charges', uc.electricity_charges,
+            'gas_charges', uc.gas_charges,
+            'service_charges', uc.service_charges,
+            'garbage_charges', uc.garbage_charges,
+            'common_area_charges', uc.common_area_charges,
+            'other_charges', uc.other_charges,
+            'other_charges_description', uc.other_charges_description,
+            'total_utility_charges', uc.total_utility_charges,
+            'billing_month', uc.billing_month,
+            'charge_status', uc.charge_status
+          )
+          FROM utility_charges uc
+          WHERE uc.lease_id = rp.lease_id
+          AND DATE_TRUNC('month', uc.billing_month) = DATE_TRUNC('month', rp.due_date)
+          AND uc.charge_status = 'billed'
+          LIMIT 1
+        ) as utility_breakdown,
+        
+        -- Calculate total amount due
+        (rp.amount_due + COALESCE(rp.utilities_charges, 0) + COALESCE(rp.late_fee, 0)) as total_amount_due,
         
         -- All tenant information for this lease
         JSON_AGG(
@@ -297,7 +351,8 @@ router.put('/:id/process', authenticateTokenSimple, async (req, res) => {
       notes,
       processed_by 
     } = req.body;
-     console.log(req.body, id)
+    console.log(req.body, id)
+    
     // Validate required fields
     if (!amount_paid || !payment_method) {
       return res.status(400).json({
@@ -317,7 +372,9 @@ router.put('/:id/process', authenticateTokenSimple, async (req, res) => {
     }
     
     const payment = currentPayment.rows[0];
-    const totalDue = parseFloat(payment.amount_due) + parseFloat(payment.late_fee || 0);
+    const totalDue = parseFloat(payment.amount_due) + 
+                     parseFloat(payment.utilities_charges || 0) +
+                     parseFloat(payment.late_fee || 0);
     const amountPaid = parseFloat(amount_paid);
     
     // Determine payment status
@@ -383,6 +440,7 @@ router.put('/:id/process', authenticateTokenSimple, async (req, res) => {
 });
 
 // Create new payment record
+
 router.post('/', authenticateTokenSimple, async (req, res) => {
   const client = await pool.connect();
   
