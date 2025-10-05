@@ -9,6 +9,7 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs/promises';
 import { fileURLToPath } from 'url';
+import { createReadStream } from 'fs';
 
 
 const router = express.Router();
@@ -208,6 +209,64 @@ router.get(
     }
   }
 );
+
+// GET /api/tenants/:id/offboarding-info - Get offboarding details for a tenant
+router.get("/:id/offboarding-info", authenticateTokenSimple, async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const tenantId = req.params.id;
+
+    // Get offboarding details from user_activity_log
+    const query = `
+      SELECT 
+        additional_data,
+        activity_timestamp,
+        user_id
+      FROM user_activity_log
+      WHERE affected_resource_id = $1
+        AND activity_type = 'tenant_offboarded'
+      ORDER BY activity_timestamp DESC
+      LIMIT 1
+    `;
+
+    const result = await client.query(query, [tenantId]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: 404,
+        message: "No offboarding information found",
+      });
+    }
+
+    const offboardingRecord = result.rows[0];
+    
+    // Get username of who processed the offboarding
+    const userQuery = `SELECT username FROM users WHERE id = $1`;
+    const userResult = await client.query(userQuery, [offboardingRecord.user_id]);
+    
+    const offboardingData = {
+      ...offboardingRecord.additional_data,
+      processedBy: userResult.rows[0]?.username,
+      offboardedAt: offboardingRecord.activity_timestamp
+    };
+
+    res.status(200).json({
+      status: 200,
+      message: "Offboarding information retrieved successfully",
+      data: offboardingData,
+    });
+  } catch (error) {
+    console.error("Offboarding info fetch error:", error);
+    res.status(500).json({
+      status: 500,
+      message: "Failed to fetch offboarding information",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
+  } finally {
+    client.release();
+  }
+});
 
 // Get all blacklisted tenants
 router.get("/blacklisted/list", authenticateTokenSimple, async (req, res) => {
@@ -2205,6 +2264,7 @@ router.put("/:id", authenticateTokenSimple, async (req, res) => {
 });
 
 // Offboard tenant (terminate lease)
+// POST /api/tenants/:id/offboard - Offboard tenant (terminate lease)
 router.post("/:id/offboard", authenticateTokenSimple, async (req, res) => {
   const client = await pool.connect();
 
@@ -2220,27 +2280,38 @@ router.post("/:id/offboard", authenticateTokenSimple, async (req, res) => {
       confirmAddress,
       keyReturn,
       inspectionFindings,
+      handleUnpaidRent = 'deduct', // 'deduct' or 'writeoff'
     } = req.body;
+
+    // Validate required fields
+    if (!moveOutDate) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        status: 400,
+        message: "Move-out date is required",
+      });
+    }
 
     // Get tenant and current lease information
     const tenantQuery = `
-        SELECT 
-          t.first_name,
-          t.last_name,
-          t.email,
-          l.id as lease_id,
-          l.lease_number,
-          l.security_deposit,
-          u.id as unit_id,
-          u.unit_number,
-          p.property_name
-        FROM tenants t
-        JOIN lease_tenants lt ON t.id = lt.tenant_id AND lt.removed_date IS NULL
-        JOIN leases l ON lt.lease_id = l.id AND l.lease_status = 'active'
-        JOIN units u ON l.unit_id = u.id
-        JOIN properties p ON u.property_id = p.id
-        WHERE t.id = $1
-      `;
+      SELECT 
+        t.first_name,
+        t.last_name,
+        t.email,
+        l.id as lease_id,
+        l.lease_number,
+        l.security_deposit,
+        l.start_date as lease_start,
+        u.id as unit_id,
+        u.unit_number,
+        p.property_name
+      FROM tenants t
+      JOIN lease_tenants lt ON t.id = lt.tenant_id AND lt.removed_date IS NULL
+      JOIN leases l ON lt.lease_id = l.id AND l.lease_status = 'active'
+      JOIN units u ON l.unit_id = u.id
+      JOIN properties p ON u.property_id = p.id
+      WHERE t.id = $1
+    `;
 
     const tenantResult = await client.query(tenantQuery, [tenantId]);
 
@@ -2254,13 +2325,152 @@ router.post("/:id/offboard", authenticateTokenSimple, async (req, res) => {
 
     const tenant = tenantResult.rows[0];
 
-    // Update lease status and move-out date
+    // ========================================
+    // STEP 1: Handle Unpaid Rent
+    // ========================================
+    
+    // Get all unpaid rent for this lease
+    const unpaidRentQuery = `
+      SELECT 
+        id, 
+        due_date, 
+        amount_due, 
+        amount_paid,
+        late_fee,
+        payment_status,
+        (amount_due + late_fee - amount_paid) as balance
+      FROM rent_payments
+      WHERE lease_id = $1 
+      AND payment_status IN ('pending', 'overdue', 'partial')
+      ORDER BY due_date
+    `;
+
+    const unpaidRentResult = await client.query(unpaidRentQuery, [tenant.lease_id]);
+    const unpaidRentRecords = unpaidRentResult.rows;
+
+    // Calculate total unpaid rent
+    const totalUnpaidRent = unpaidRentRecords.reduce((sum, payment) => {
+      return sum + parseFloat(payment.balance);
+    }, 0);
+
+    let rentSettlementMethod = 'none';
+    let finalDeductions = [...deductions];
+
+    // Handle unpaid rent based on selected method
+    if (totalUnpaidRent > 0) {
+      if (handleUnpaidRent === 'deduct') {
+        // OPTION 1: Deduct from security deposit
+        rentSettlementMethod = 'deducted_from_deposit';
+        
+        // Add unpaid rent to deductions
+        finalDeductions.push({
+          description: 'Unpaid Rent Settlement',
+          amount: totalUnpaidRent
+        });
+        
+        // Mark all unpaid rent as "paid from deposit"
+        for (const payment of unpaidRentRecords) {
+          const amountToSettle = parseFloat(payment.balance);
+          const newAmountPaid = parseFloat(payment.amount_paid) + amountToSettle;
+          
+          await client.query(
+            `UPDATE rent_payments 
+             SET payment_status = 'paid',
+                 payment_method = 'Security Deposit Deduction',
+                 payment_date = $1,
+                 amount_paid = $2,
+                 notes = COALESCE(notes || ' | ', '') || 'Settled from security deposit during offboarding',
+                 processed_by = $3,
+                 processed_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = $4`,
+            [moveOutDate, newAmountPaid, req.user.username, payment.id]
+          );
+
+          // Log payment history
+          await client.query(
+            `INSERT INTO payment_history 
+             (payment_id, change_type, old_status, new_status, old_amount, new_amount, changed_by, change_reason)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            [
+              payment.id,
+              'payment_received',
+              payment.payment_status,
+              'paid',
+              payment.amount_paid,
+              newAmountPaid,
+              req.user.id,
+              'Settled from security deposit during tenant offboarding'
+            ]
+          );
+        }
+      } else if (handleUnpaidRent === 'writeoff') {
+        // OPTION 2: Write off as bad debt
+        rentSettlementMethod = 'written_off';
+        
+        for (const payment of unpaidRentRecords) {
+          await client.query(
+            `UPDATE rent_payments 
+             SET payment_status = 'written_off',
+                 notes = COALESCE(notes || ' | ', '') || 'Written off as bad debt - tenant offboarded with unpaid balance',
+                 processed_by = $1,
+                 processed_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = $2`,
+            [req.user.username, payment.id]
+          );
+
+          // Log payment history
+          await client.query(
+            `INSERT INTO payment_history 
+             (payment_id, change_type, old_status, new_status, changed_by, change_reason, additional_data)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [
+              payment.id,
+              'status_updated',
+              payment.payment_status,
+              'written_off',
+              req.user.id,
+              'Written off during tenant offboarding',
+              JSON.stringify({ unpaid_amount: payment.balance })
+            ]
+          );
+        }
+        
+        // Log the debt in activity log
+        await client.query(
+          `INSERT INTO user_activity_log 
+           (user_id, activity_type, activity_description, affected_resource_type, affected_resource_id, additional_data)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [
+            req.user.id,
+            'tenant_debt_recorded',
+            `Tenant offboarded with written-off unpaid rent: ${formatCurrency(totalUnpaidRent)}`,
+            'tenant',
+            tenantId,
+            JSON.stringify({ 
+              unpaidRent: totalUnpaidRent, 
+              rentRecords: unpaidRentRecords.map(r => ({
+                id: r.id,
+                due_date: r.due_date,
+                balance: r.balance
+              }))
+            })
+          ]
+        );
+      }
+    }
+
+    // ========================================
+    // STEP 2: Update Lease Status
+    // ========================================
+    
     await client.query(
       `UPDATE leases SET 
          lease_status = 'terminated',
          move_out_date = $1,
          updated_at = CURRENT_TIMESTAMP
-         WHERE id = $2`,
+       WHERE id = $2`,
       [moveOutDate, tenant.lease_id]
     );
 
@@ -2271,35 +2481,64 @@ router.post("/:id/offboard", authenticateTokenSimple, async (req, res) => {
     );
 
     // Update unit status to vacant
-    await client.query("UPDATE units SET occupancy_status = $1 WHERE id = $2", [
-      "vacant",
-      tenant.unit_id,
-    ]);
+    await client.query(
+      "UPDATE units SET occupancy_status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2", 
+      ["vacant", tenant.unit_id]
+    );
 
-    // Calculate total deductions
-    const totalDeductions = deductions.reduce(
+    // ========================================
+    // STEP 3: Process Security Deposit
+    // ========================================
+    
+    // Calculate total deductions (including unpaid rent if deducted)
+    const totalDeductions = finalDeductions.reduce(
       (sum, deduction) => sum + (parseFloat(deduction.amount) || 0),
       0
     );
 
-    // Process security deposit return
-    const actualRefund = Math.max(0, tenant.security_deposit - totalDeductions);
+    // Parse values correctly
+    const originalDeposit = parseFloat(tenant.security_deposit) || 0;
+    const actualRefund = Math.max(0, originalDeposit - totalDeductions);
 
+    // Validate the math
+    if (totalDeductions > originalDeposit) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        status: 400,
+        message: `Total deductions (${formatCurrency(totalDeductions)}) exceed security deposit (${formatCurrency(originalDeposit)})`,
+        data: {
+          originalDeposit,
+          totalDeductions,
+          deductions: finalDeductions
+        }
+      });
+    }
+
+    // Create security deposit settlement record
     await client.query(
       `INSERT INTO security_deposits (
-          lease_id, deposit_type, amount_collected, collection_date,
-          amount_returned, return_date, deductions, deduction_reason, status
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          lease_id, 
+          deposit_type, 
+          amount_collected, 
+          collection_date,
+          amount_returned, 
+          return_date, 
+          deductions, 
+          deduction_reason, 
+          deduction_itemization,
+          status
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
       [
         tenant.lease_id,
         "Security",
-        tenant.security_deposit,
-        new Date(), // Assuming collected at lease start
+        originalDeposit,
+        tenant.lease_start || new Date(),
         actualRefund,
         moveOutDate,
         totalDeductions,
-        deductions.map((d) => `${d.description}: $${d.amount}`).join("; "),
-        actualRefund === tenant.security_deposit
+        finalDeductions.map((d) => `${d.description}: ${formatCurrency(d.amount)}`).join("; "),
+        JSON.stringify(finalDeductions),
+        actualRefund === originalDeposit
           ? "fully_returned"
           : actualRefund > 0
             ? "partially_returned"
@@ -2307,34 +2546,37 @@ router.post("/:id/offboard", authenticateTokenSimple, async (req, res) => {
       ]
     );
 
-    // Create offboarding document record
+    // ========================================
+    // STEP 4: Create Offboarding Record
+    // ========================================
+    
     const offboardingData = {
       moveOutDate,
       depositRefund: actualRefund,
-      deductions,
+      deductions: finalDeductions.map(d => ({
+        description: d.description,
+        amount: parseFloat(d.amount) || 0
+      })),
       totalDeductions,
+      originalDeposit,
       notes,
       confirmAddress,
       keyReturn,
       inspectionFindings,
       processedBy: req.user.username,
       processedAt: new Date(),
+      
+      // Rent settlement information
+      unpaidRentAmount: totalUnpaidRent,
+      rentSettlementMethod,
+      unpaidRentRecords: unpaidRentRecords.length > 0 ? unpaidRentRecords.map(r => ({
+        id: r.id,
+        due_date: r.due_date,
+        balance: r.balance
+      })) : []
     };
 
-    await client.query(
-      `INSERT INTO tenant_documents (
-          tenant_id, document_type, document_name, upload_date, uploaded_by
-        ) VALUES ($1, $2, $3, $4, $5)`,
-      [
-        tenantId,
-        "Other",
-        `Offboarding Record - ${tenant.lease_number}`,
-        new Date(),
-        req.user.username,
-      ]
-    );
-
-    // Log activity
+    // Log offboarding activity
     await client.query(
       `INSERT INTO user_activity_log 
          (user_id, activity_type, activity_description, affected_resource_type, affected_resource_id, ip_address, user_agent, additional_data)
@@ -2362,6 +2604,8 @@ router.post("/:id/offboard", authenticateTokenSimple, async (req, res) => {
         moveOutDate,
         securityDepositRefund: actualRefund,
         totalDeductions,
+        unpaidRentSettled: totalUnpaidRent,
+        rentSettlementMethod,
         processedAt: new Date(),
       },
     });
@@ -2372,6 +2616,65 @@ router.post("/:id/offboard", authenticateTokenSimple, async (req, res) => {
     res.status(500).json({
       status: 500,
       message: "Failed to offboard tenant",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// Helper function (add at top of file if not exists)
+function formatCurrency(amount) {
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'KES'
+  }).format(amount);
+}
+
+// GET /api/tenants/:id/unpaid-rent - Get total unpaid rent for tenant
+router.get("/:id/unpaid-rent", authenticateTokenSimple, async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const tenantId = req.params.id;
+
+    const query = `
+      SELECT 
+        rp.id,
+        rp.due_date,
+        rp.amount_due,
+        rp.amount_paid,
+        rp.late_fee,
+        rp.payment_status,
+        (rp.amount_due + rp.late_fee - rp.amount_paid) as balance
+      FROM rent_payments rp
+      JOIN leases l ON rp.lease_id = l.id
+      JOIN lease_tenants lt ON l.id = lt.lease_id
+      WHERE lt.tenant_id = $1
+      AND rp.payment_status IN ('pending', 'overdue', 'partial')
+      ORDER BY rp.due_date
+    `;
+
+    const result = await client.query(query, [tenantId]);
+    
+    const totalUnpaid = result.rows.reduce((sum, payment) => 
+      sum + parseFloat(payment.balance), 0
+    );
+
+    res.status(200).json({
+      status: 200,
+      message: "Unpaid rent retrieved successfully",
+      data: {
+        totalUnpaid,
+        payments: result.rows,
+        count: result.rows.length
+      }
+    });
+  } catch (error) {
+    console.error("Unpaid rent fetch error:", error);
+    res.status(500).json({
+      status: 500,
+      message: "Failed to fetch unpaid rent",
       error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   } finally {
@@ -2428,33 +2731,111 @@ router.get("/:id/payments", authenticateTokenSimple, async (req, res) => {
 });
 
 // Get tenant documents
+// GET /api/tenants/:id/documents - Get all documents for a tenant
 router.get("/:id/documents", authenticateTokenSimple, async (req, res) => {
   const client = await pool.connect();
 
   try {
     const tenantId = req.params.id;
 
-    const documentsQuery = `
-        SELECT 
-          id,
-          document_type,
-          document_name,
-          file_path,
-          file_size,
-          mime_type,
-          upload_date,
-          uploaded_by
-        FROM tenant_documents
-        WHERE tenant_id = $1
-        ORDER BY upload_date DESC
-      `;
+    // Check if tenant exists
+    const tenantCheck = await client.query(
+      "SELECT id FROM tenants WHERE id = $1",
+      [tenantId]
+    );
+
+    if (tenantCheck.rows.length === 0) {
+      return res.status(404).json({
+        status: 404,
+        message: "Tenant not found",
+      });
+    }
+
+    // Query both tenant_documents and documents tables
+   // Query both tenant_documents and documents tables
+const documentsQuery = `
+SELECT 
+  id,
+  document_type,
+  document_name,
+  file_path,
+  file_size,
+  mime_type,
+  upload_date,
+  uploaded_by::VARCHAR as uploaded_by,
+  is_verified,
+  verified_by::VARCHAR as verified_by,
+  verified_date,
+  expiration_date
+FROM (
+  SELECT 
+    td.id,
+    td.document_type,
+    td.document_name,
+    td.file_path,
+    td.file_size,
+    td.mime_type,
+    td.upload_date,
+    CASE 
+      WHEN td.uploaded_by IS NOT NULL THEN 
+        (SELECT u.username FROM users u WHERE u.id = td.uploaded_by)
+      ELSE NULL 
+    END as uploaded_by,
+    td.is_verified,
+    CASE 
+      WHEN td.verified_by IS NOT NULL THEN 
+        (SELECT u.username FROM users u WHERE u.id = td.verified_by)
+      ELSE NULL 
+    END as verified_by,
+    td.verified_date,
+    td.expiration_date
+  FROM tenant_documents td
+  WHERE td.tenant_id = $1
+  
+  UNION ALL
+  
+  SELECT 
+    d.id,
+    d.document_type,
+    d.document_name,
+    d.file_path,
+    d.file_size,
+    d.mime_type,
+    d.uploaded_at as upload_date,
+    d.uploaded_by,
+    false as is_verified,
+    NULL as verified_by,
+    NULL as verified_date,
+    d.expires_at as expiration_date
+  FROM documents d
+  WHERE d.tenant_id = $1
+) combined
+ORDER BY upload_date DESC
+`;
 
     const result = await client.query(documentsQuery, [tenantId]);
+
+    // Format the documents for frontend
+    const formattedDocuments = result.rows.map(doc => ({
+      id: doc.id,
+      name: doc.document_name,
+      type: doc.document_type,
+      date: doc.upload_date,
+      uploadedAt: doc.upload_date,
+      uploadedBy: doc.uploaded_by,
+      size: doc.file_size,
+      mimeType: doc.mime_type,
+      filePath: doc.file_path,
+      isVerified: doc.is_verified,
+      verifiedBy: doc.verified_by,
+      verifiedDate: doc.verified_date,
+      expirationDate: doc.expiration_date
+    }));
 
     res.status(200).json({
       status: 200,
       message: "Tenant documents retrieved successfully",
-      data: result.rows,
+      data: formattedDocuments,
     });
   } catch (error) {
     console.error("Documents fetch error:", error);
@@ -2462,6 +2843,174 @@ router.get("/:id/documents", authenticateTokenSimple, async (req, res) => {
     res.status(500).json({
       status: 500,
       message: "Failed to fetch tenant documents",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /api/tenants/documents/:documentId/download - Download a document
+router.get("/documents/:documentId/download", authenticateTokenSimple, async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const documentId = req.params.documentId;
+
+    // Try to find document in tenant_documents first
+    let documentQuery = `
+      SELECT 
+        td.file_path,
+        td.document_name,
+        td.mime_type,
+        td.tenant_id
+      FROM tenant_documents td
+      WHERE td.id = $1
+    `;
+
+    let result = await client.query(documentQuery, [documentId]);
+
+    // If not found, try documents table
+    if (result.rows.length === 0) {
+      documentQuery = `
+        SELECT 
+          d.file_path,
+          d.document_name,
+          d.mime_type,
+          d.tenant_id
+        FROM documents d
+        WHERE d.id = $1
+      `;
+
+      result = await client.query(documentQuery, [documentId]);
+    }
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: 404,
+        message: "Document not found",
+      });
+    }
+
+    const document = result.rows[0];
+
+    // Check if file exists
+    try {
+      await fs.access(document.file_path);
+    } catch (error) {
+      return res.status(404).json({
+        status: 404,
+        message: "File not found on server",
+      });
+    }
+
+    // Log document access
+    await logDocumentAccess(
+      client,
+      documentId,
+      req.user.id,
+      'download',
+      req.ip,
+      req.headers['user-agent']
+    );
+
+    // Set headers for file download
+    res.setHeader('Content-Type', document.mime_type || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${document.document_name}"`);
+
+    // Stream the file
+    const fileStream = createReadStream(document.file_path);
+    fileStream.pipe(res);
+
+  } catch (error) {
+    console.error("Document download error:", error);
+    res.status(500).json({
+      status: 500,
+      message: "Failed to download document",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /api/tenants/documents/:documentId/view - View a document (inline)
+router.get("/documents/:documentId/view", authenticateTokenSimple, async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const documentId = req.params.documentId;
+
+    // Try to find document in tenant_documents first
+    let documentQuery = `
+      SELECT 
+        td.file_path,
+        td.document_name,
+        td.mime_type,
+        td.tenant_id
+      FROM tenant_documents td
+      WHERE td.id = $1
+    `;
+
+    let result = await client.query(documentQuery, [documentId]);
+
+    // If not found, try documents table
+    if (result.rows.length === 0) {
+      documentQuery = `
+        SELECT 
+          d.file_path,
+          d.document_name,
+          d.mime_type,
+          d.tenant_id
+        FROM documents d
+        WHERE d.id = $1
+      `;
+
+      result = await client.query(documentQuery, [documentId]);
+    }
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: 404,
+        message: "Document not found",
+      });
+    }
+
+    const document = result.rows[0];
+
+    // Check if file exists
+    try {
+      await fs.access(document.file_path);
+    } catch (error) {
+      return res.status(404).json({
+        status: 404,
+        message: "File not found on server",
+      });
+    }
+
+    // Log document access
+    await logDocumentAccess(
+      client,
+      documentId,
+      req.user.id,
+      'view',
+      req.ip,
+      req.headers['user-agent']
+    );
+
+    // Set headers for inline viewing
+    res.setHeader('Content-Type', document.mime_type || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `inline; filename="${document.document_name}"`);
+
+    // Stream the file
+    const fileStream = createReadStream(document.file_path);
+    fileStream.pipe(res);
+
+  } catch (error) {
+    console.error("Document view error:", error);
+    res.status(500).json({
+      status: 500,
+      message: "Failed to view document",
       error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   } finally {
