@@ -2746,7 +2746,7 @@ router.get("/:id/documents", authenticateTokenSimple, async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const tenantId = req.params.id;
+    const tenantId = parseInt(req.params.id);
 
     // Check if tenant exists
     const tenantCheck = await client.query(
@@ -2761,7 +2761,7 @@ router.get("/:id/documents", authenticateTokenSimple, async (req, res) => {
       });
     }
 
-    // Get documents from tenant_documents table
+    // Get documents from tenant_documents table - NO JOIN needed, uploaded_by is already VARCHAR
     const tenantDocsQuery = `
       SELECT 
         td.id,
@@ -2771,19 +2771,18 @@ router.get("/:id/documents", authenticateTokenSimple, async (req, res) => {
         td.file_size,
         td.mime_type,
         td.upload_date,
-        u1.username as uploaded_by,
+        td.uploaded_by,
         td.is_verified,
-        u2.username as verified_by,
+        td.verified_by,
         td.verified_date,
         td.expiration_date,
         'tenant_documents' as source_table
       FROM tenant_documents td
-      LEFT JOIN users u1 ON td.uploaded_by = u1.id
-      LEFT JOIN users u2 ON td.verified_by = u2.id
       WHERE td.tenant_id = $1
+      ORDER BY td.upload_date DESC
     `;
 
-    // Get documents from documents table
+    // Get documents from documents table - uploaded_by is also VARCHAR
     const docsQuery = `
       SELECT 
         d.id,
@@ -2796,22 +2795,29 @@ router.get("/:id/documents", authenticateTokenSimple, async (req, res) => {
         d.uploaded_by,
         false as is_verified,
         NULL as verified_by,
-        NULL as verified_date,
+        NULL::timestamp as verified_date,
         d.expires_at as expiration_date,
         'documents' as source_table
       FROM documents d
       WHERE d.tenant_id = $1
+      ORDER BY d.uploaded_at DESC
     `;
 
-    // Execute both queries
-    const tenantDocsResult = await client.query(tenantDocsQuery, [tenantId]);
-    const docsResult = await client.query(docsQuery, [tenantId]);
+    // Execute both queries in parallel
+    const [tenantDocsResult, docsResult] = await Promise.all([
+      client.query(tenantDocsQuery, [tenantId]),
+      client.query(docsQuery, [tenantId])
+    ]);
 
     // Combine results
     const allDocuments = [...tenantDocsResult.rows, ...docsResult.rows];
 
-    // Sort by upload date
-    allDocuments.sort((a, b) => new Date(b.upload_date) - new Date(a.upload_date));
+    // Sort by upload date (most recent first)
+    allDocuments.sort((a, b) => {
+      const dateA = new Date(a.upload_date);
+      const dateB = new Date(b.upload_date);
+      return dateB - dateA;
+    });
 
     // Format the documents for frontend
     const formattedDocuments = allDocuments.map(doc => ({
@@ -2820,7 +2826,7 @@ router.get("/:id/documents", authenticateTokenSimple, async (req, res) => {
       type: doc.document_type,
       date: doc.upload_date,
       uploadedAt: doc.upload_date,
-      uploadedBy: doc.uploaded_by,
+      uploadedBy: doc.uploaded_by || 'Unknown',
       size: doc.file_size,
       mimeType: doc.mime_type,
       filePath: doc.file_path,
@@ -2848,7 +2854,6 @@ router.get("/:id/documents", authenticateTokenSimple, async (req, res) => {
     client.release();
   }
 });
-
 
 // GET /api/tenants/documents/:documentId/download - Download a document
 router.get("/documents/:documentId/download", authenticateTokenSimple, async (req, res) => {
