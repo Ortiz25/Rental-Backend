@@ -477,7 +477,7 @@ router.post('/tenant/upload', authenticateTokenSimple, upload.array('files', 5),
 
     const {
       document_name,
-      category, // This will be document_type for tenant_documents
+      category,
       description,
       tenant_id
     } = req.body;
@@ -499,7 +499,7 @@ router.post('/tenant/upload', authenticateTokenSimple, upload.array('files', 5),
     const uploadedDocuments = [];
 
     for (const file of req.files) {
-      // Insert into tenant_documents table
+      // Insert ONLY into tenant_documents table
       const documentResult = await client.query(`
         INSERT INTO tenant_documents (
           tenant_id,
@@ -522,36 +522,11 @@ router.post('/tenant/upload', authenticateTokenSimple, upload.array('files', 5),
       ]);
 
       const document = documentResult.rows[0];
-      
-      // Also insert into main documents table for unified access
-      await client.query(`
-        INSERT INTO documents (
-          document_name, 
-          original_filename, 
-          file_path, 
-          file_size, 
-          file_type, 
-          mime_type,
-          tenant_id,
-          uploaded_by,
-          tags
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-      `, [
-        document_name || file.originalname,
-        file.originalname,
-        file.path,
-        file.size,
-        getFileExtension(file.mimetype),
-        file.mimetype,
-        tenant_id,
-        req.user.username || req.user.id,
-        [category, 'tenant-document']
-      ]);
 
       uploadedDocuments.push({
         id: document.id,
         name: document.document_name,
-        size: formatFileSize(document.file_size),  // ← Now this will work
+        size: formatFileSize(document.file_size),
         uploadedAt: document.upload_date
       });
     }
