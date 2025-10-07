@@ -583,123 +583,145 @@ router.get('/properties', authenticateTokenSimple, async (req, res) => {
   });
   
 
-
-// GET /api/documents/:id/download - Download a document
-router.get('/:id/download', authenticateTokenSimple, async (req, res) => {
-  const client = await pool.connect();
-  
-  try {
-    const documentId = req.params.id;
-    console.log("📥 Downloading document ID:", documentId);
-    
-    const result = await client.query(`
-      SELECT file_path, original_filename, mime_type, document_name, file_size
-      FROM documents 
-      WHERE id = $1 AND document_status = 'active'
-    `, [documentId]);
-
-    console.log("📄 Document query result:", result.rows);
-    
-    if (result.rows.length === 0) {
-      console.log("❌ Document not found in database");
-      return res.status(404).json({
-        status: 404,
-        message: 'Document not found'
-      });
-    }
-
-    const document = result.rows[0];
-    console.log("📁 Checking file path:", document.file_path);
-    
-    // Check if file exists
-    try {
-      await fs.access(document.file_path);
-      console.log("✅ File exists on server");
-    } catch (error) {
-      console.log("❌ File not found on server:", error.message);
-      return res.status(404).json({
-        status: 404,
-        message: 'File not found on server',
-        filePath: document.file_path
-      });
-    }
-
-    // Log access (but don't let it fail the download)
-    try {
-      await logDocumentAccess(
-        client, 
-        documentId, 
-        req.user.username || req.user.id, 
-        'download',
-        req.ip,
-        req.get('User-Agent')
-      );
-      console.log("✅ Document access logged");
-    } catch (logError) {
-      console.warn("⚠️ Failed to log document access:", logError.message);
-      // Continue with download even if logging fails
-    }
-
-    // Set appropriate headers for download
-    res.setHeader('Content-Disposition', `attachment; filename="${document.original_filename}"`);
-    res.setHeader('Content-Type', document.mime_type);
-    
-    // Set content length if available
-    if (document.file_size) {
-      res.setHeader('Content-Length', document.file_size);
-    }
-
-    console.log("📤 Starting file stream...");
-    
-    // Stream the file using createReadStream for better performance
-    const path = await import('path');
-    const { createReadStream } = await import('fs');
+  router.get('/:id/download', authenticateTokenSimple, async (req, res) => {
+    const client = await pool.connect();
     
     try {
-      const fileStream = createReadStream(document.file_path);
+      const documentId = req.params.id;
+      console.log("📥 Downloading document ID:", documentId);
       
-      fileStream.on('error', (streamError) => {
-        console.error("❌ File stream error:", streamError);
+      // Try to find document in main documents table first
+      let result = await client.query(`
+        SELECT 
+          file_path, 
+          original_filename, 
+          mime_type, 
+          document_name, 
+          file_size,
+          'documents' as source_table
+        FROM documents 
+        WHERE id = $1 AND document_status = 'active'
+      `, [documentId]);
+  
+      // If not found, try tenant_documents table
+      if (result.rows.length === 0) {
+        console.log("📋 Document not found in documents table, checking tenant_documents...");
+        result = await client.query(`
+          SELECT 
+            file_path, 
+            document_name as original_filename, 
+            mime_type, 
+            document_name, 
+            file_size,
+            'tenant_documents' as source_table
+          FROM tenant_documents 
+          WHERE id = $1
+        `, [documentId]);
+      }
+  
+      console.log("📄 Document query result:", result.rows);
+      
+      if (result.rows.length === 0) {
+        console.log("❌ Document not found in any table");
+        return res.status(404).json({
+          status: 404,
+          message: 'Document not found'
+        });
+      }
+  
+      const document = result.rows[0];
+      console.log(`📁 Document found in ${document.source_table} table`);
+      console.log("📁 Checking file path:", document.file_path);
+      
+      // Check if file exists
+      try {
+        await fs.access(document.file_path);
+        console.log("✅ File exists on server");
+      } catch (error) {
+        console.log("❌ File not found on server:", error.message);
+        return res.status(404).json({
+          status: 404,
+          message: 'File not found on server',
+          filePath: process.env.NODE_ENV === 'development' ? document.file_path : undefined
+        });
+      }
+  
+      // Log access (but don't let it fail the download)
+      try {
+        await logDocumentAccess(
+          client, 
+          documentId, 
+          req.user.username || req.user.id, 
+          'download',
+          req.ip,
+          req.get('User-Agent')
+        );
+        console.log("✅ Document access logged");
+      } catch (logError) {
+        console.warn(`⚠️ Failed to log ${document.source_table} access:`, logError.message);
+        // Continue with download even if logging fails
+      }
+  
+      // Set appropriate headers for download
+      res.setHeader('Content-Disposition', `attachment; filename="${document.original_filename}"`);
+      res.setHeader('Content-Type', document.mime_type || 'application/octet-stream');
+      
+      // Set content length if available
+      if (document.file_size) {
+        res.setHeader('Content-Length', document.file_size);
+      }
+  
+      console.log("📤 Starting file stream...");
+      
+      // Stream the file using createReadStream for better performance
+      const path = await import('path');
+      const { createReadStream } = await import('fs');
+      
+      try {
+        const fileStream = createReadStream(document.file_path);
+        
+        fileStream.on('error', (streamError) => {
+          console.error("❌ File stream error:", streamError);
+          if (!res.headersSent) {
+            res.status(500).json({
+              status: 500,
+              message: 'Error reading file',
+              error: streamError.message
+            });
+          }
+        });
+  
+        fileStream.on('end', () => {
+          console.log(`✅ File download completed from ${document.source_table}`);
+        });
+  
+        // Pipe the file to the response
+        fileStream.pipe(res);
+        
+      } catch (streamError) {
+        console.error("❌ Error creating file stream:", streamError);
         if (!res.headersSent) {
           res.status(500).json({
             status: 500,
-            message: 'Error reading file',
+            message: 'Error streaming file',
             error: streamError.message
           });
         }
-      });
-
-      fileStream.on('end', () => {
-        console.log("✅ File download completed");
-      });
-
-      // Pipe the file to the response
-      fileStream.pipe(res);
-      
-    } catch (streamError) {
-      console.error("❌ Error creating file stream:", streamError);
+      }
+  
+    } catch (error) {
+      console.error('❌ Document download error:', error);
       if (!res.headersSent) {
         res.status(500).json({
           status: 500,
-          message: 'Error streaming file',
-          error: streamError.message
+          message: 'Failed to download document',
+          error: process.env.NODE_ENV === 'development' ? error.message : undefined
         });
       }
+    } finally {
+      client.release();
     }
-
-  } catch (error) {
-    console.error('❌ Document download error:', error);
-    if (!res.headersSent) {
-      res.status(500).json({
-        status: 500,
-        message: 'Failed to download document',
-        error: process.env.NODE_ENV === 'development' ? error.message : undefined
-      });
-    }
-  } finally {
-    client.release();
-  }
-});
+  });
 
 // Add this debug route to your backend to check file status
 router.get('/:id/check', authenticateTokenSimple, async (req, res) => {
@@ -781,11 +803,31 @@ router.get('/:id/view', authenticateTokenSimple, async (req, res) => {
   try {
     const documentId = req.params.id;
     
-    const result = await client.query(`
-      SELECT file_path, original_filename, mime_type, document_name
+    // Try to find document in main documents table first
+    let result = await client.query(`
+      SELECT 
+        file_path, 
+        original_filename, 
+        mime_type, 
+        document_name,
+        'documents' as source_table
       FROM documents 
       WHERE id = $1 AND document_status = 'active'
     `, [documentId]);
+
+    // If not found, try tenant_documents table
+    if (result.rows.length === 0) {
+      result = await client.query(`
+        SELECT 
+          file_path, 
+          document_name as original_filename, 
+          mime_type, 
+          document_name,
+          'tenant_documents' as source_table
+        FROM tenant_documents 
+        WHERE id = $1
+      `, [documentId]);
+    }
 
     if (result.rows.length === 0) {
       return res.status(404).json({
@@ -800,21 +842,41 @@ router.get('/:id/view', authenticateTokenSimple, async (req, res) => {
     try {
       await fs.access(document.file_path);
     } catch (error) {
+      console.error('File not found on disk:', document.file_path);
       return res.status(404).json({
         status: 404,
-        message: 'File not found on server'
+        message: 'File not found on server',
+        details: process.env.NODE_ENV === 'development' ? document.file_path : undefined
       });
     }
 
-    // Log access
-    await logDocumentAccess(
-      client, 
-      documentId, 
-      req.user.username || req.user.id, 
-      'view',
-      req.ip,
-      req.get('User-Agent')
-    );
+    // Log access based on source table
+    if (document.source_table === 'documents') {
+      await logDocumentAccess(
+        client, 
+        documentId, 
+        req.user.username || req.user.id, 
+        'view',
+        req.ip,
+        req.get('User-Agent')
+      );
+    } else {
+      // For tenant_documents, you might want a different logging approach
+      // or skip logging if logDocumentAccess is only for documents table
+      try {
+        await logDocumentAccess(
+          client, 
+          documentId, 
+          req.user.username || req.user.id, 
+          'view',
+          req.ip,
+          req.get('User-Agent')
+        );
+      } catch (logError) {
+        // Log error but don't fail the request
+        console.log('Could not log tenant document access:', logError.message);
+      }
+    }
 
     // Set appropriate headers for inline viewing
     res.setHeader('Content-Type', document.mime_type);
