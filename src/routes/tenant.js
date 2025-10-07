@@ -11,6 +11,17 @@ import fs from 'fs/promises';
 import { fileURLToPath } from 'url';
 import { createReadStream } from 'fs';
 
+// Add this helper function near the top of the file, after imports
+const formatFileSize = (bytes) => {
+  if (!bytes || bytes === 0) return '0 Bytes';
+  
+  const k = 1024;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  
+  return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i];
+};
+
 
 const router = express.Router();
 const __filename = fileURLToPath(import.meta.url);
@@ -540,7 +551,7 @@ router.post('/tenant/upload', authenticateTokenSimple, upload.array('files', 5),
       uploadedDocuments.push({
         id: document.id,
         name: document.document_name,
-        size: formatFileSize(document.file_size),
+        size: formatFileSize(document.file_size),  // ← Now this will work
         uploadedAt: document.upload_date
       });
     }
@@ -2730,7 +2741,6 @@ router.get("/:id/payments", authenticateTokenSimple, async (req, res) => {
   }
 });
 
-// Get tenant documents
 // GET /api/tenants/:id/documents - Get all documents for a tenant
 router.get("/:id/documents", authenticateTokenSimple, async (req, res) => {
   const client = await pool.connect();
@@ -2751,72 +2761,60 @@ router.get("/:id/documents", authenticateTokenSimple, async (req, res) => {
       });
     }
 
-    // Query both tenant_documents and documents tables
-   // Query both tenant_documents and documents tables
-const documentsQuery = `
-SELECT 
-  id,
-  document_type,
-  document_name,
-  file_path,
-  file_size,
-  mime_type,
-  upload_date,
-  uploaded_by::VARCHAR as uploaded_by,
-  is_verified,
-  verified_by::VARCHAR as verified_by,
-  verified_date,
-  expiration_date
-FROM (
-  SELECT 
-    td.id,
-    td.document_type,
-    td.document_name,
-    td.file_path,
-    td.file_size,
-    td.mime_type,
-    td.upload_date,
-    CASE 
-      WHEN td.uploaded_by IS NOT NULL THEN 
-        (SELECT u.username FROM users u WHERE u.id = td.uploaded_by)
-      ELSE NULL 
-    END as uploaded_by,
-    td.is_verified,
-    CASE 
-      WHEN td.verified_by IS NOT NULL THEN 
-        (SELECT u.username FROM users u WHERE u.id = td.verified_by)
-      ELSE NULL 
-    END as verified_by,
-    td.verified_date,
-    td.expiration_date
-  FROM tenant_documents td
-  WHERE td.tenant_id = $1
-  
-  UNION ALL
-  
-  SELECT 
-    d.id,
-    d.document_type,
-    d.document_name,
-    d.file_path,
-    d.file_size,
-    d.mime_type,
-    d.uploaded_at as upload_date,
-    d.uploaded_by,
-    false as is_verified,
-    NULL as verified_by,
-    NULL as verified_date,
-    d.expires_at as expiration_date
-  FROM documents d
-  WHERE d.tenant_id = $1
-) combined
-ORDER BY upload_date DESC
-`;
+    // Get documents from tenant_documents table
+    const tenantDocsQuery = `
+      SELECT 
+        td.id,
+        td.document_type,
+        td.document_name,
+        td.file_path,
+        td.file_size,
+        td.mime_type,
+        td.upload_date,
+        u1.username as uploaded_by,
+        td.is_verified,
+        u2.username as verified_by,
+        td.verified_date,
+        td.expiration_date,
+        'tenant_documents' as source_table
+      FROM tenant_documents td
+      LEFT JOIN users u1 ON td.uploaded_by = u1.id
+      LEFT JOIN users u2 ON td.verified_by = u2.id
+      WHERE td.tenant_id = $1
+    `;
 
-    const result = await client.query(documentsQuery, [tenantId]);
+    // Get documents from documents table
+    const docsQuery = `
+      SELECT 
+        d.id,
+        d.document_type,
+        d.document_name,
+        d.file_path,
+        d.file_size,
+        d.mime_type,
+        d.uploaded_at as upload_date,
+        d.uploaded_by,
+        false as is_verified,
+        NULL as verified_by,
+        NULL as verified_date,
+        d.expires_at as expiration_date,
+        'documents' as source_table
+      FROM documents d
+      WHERE d.tenant_id = $1
+    `;
+
+    // Execute both queries
+    const tenantDocsResult = await client.query(tenantDocsQuery, [tenantId]);
+    const docsResult = await client.query(docsQuery, [tenantId]);
+
+    // Combine results
+    const allDocuments = [...tenantDocsResult.rows, ...docsResult.rows];
+
+    // Sort by upload date
+    allDocuments.sort((a, b) => new Date(b.upload_date) - new Date(a.upload_date));
 
     // Format the documents for frontend
-    const formattedDocuments = result.rows.map(doc => ({
+    const formattedDocuments = allDocuments.map(doc => ({
       id: doc.id,
       name: doc.document_name,
       type: doc.document_type,
@@ -2829,7 +2827,8 @@ ORDER BY upload_date DESC
       isVerified: doc.is_verified,
       verifiedBy: doc.verified_by,
       verifiedDate: doc.verified_date,
-      expirationDate: doc.expiration_date
+      expirationDate: doc.expiration_date,
+      source: doc.source_table
     }));
 
     res.status(200).json({
@@ -2849,6 +2848,7 @@ ORDER BY upload_date DESC
     client.release();
   }
 });
+
 
 // GET /api/tenants/documents/:documentId/download - Download a document
 router.get("/documents/:documentId/download", authenticateTokenSimple, async (req, res) => {
