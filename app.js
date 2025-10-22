@@ -26,6 +26,7 @@ import docmentRoutes from "./src/routes/documents.js"
 import paymentMethodsRoutes from "./src/routes/paymentMethods.js"
 import systemSettingsRoutes from "./src/routes/systemSettings.js"
 import utilityChargesRoutes from "./src/routes/utilityCharges.js"
+import passwordMgtRoutes from "./src/routes/passwordMgt.js"
 
 const app = express();
 
@@ -63,43 +64,8 @@ app.use('/api/documents', docmentRoutes)
 app.use('/api/payment-methods', paymentMethodsRoutes)
 app.use('/api/system-settings', systemSettingsRoutes)
 app.use('/api/utility-charges', utilityChargesRoutes)
+app.use('/api/password', passwordMgtRoutes)
 
-
-
-// app.use('/api/auth', authRoutes);
-// app.use('/api/students', studentRoutes);
-// app.use('/api/teachers', teacherRoutes);
-// app.use('/api/classes', classRoutes);
-// app.use('/api/attendance', attendanceRoutes);
-// app.use('/api/dashboard', dashRoutes);
-// app.use('/api/academic', academicRoutes);
-// app.use('/api/hostels', hostelRoutes);
-// app.use('/api/hostel-transport', transportRoutes);
-// app.use('/api/library', libraryRoutes);
-// app.use('/api/timetable', timetableRoutes);
-// app.use('/api/subjects', subjectsRoutes);
-// app.use('/api/rooms', roomRoutes);
-// app.use('/api/leaves', leaveRoutes);
-// app.use('/api/leavetypes', leaveTypeRoutes);
-// app.use('/api/allocations', allocationsRoutes);
-// app.use('/api/sessions', academicSessionsRoutes);
-// app.use('/api/helpers', helperRoutes);
-// app.use('/api/exams', examsRoutes);
-// app.use('/api/examgrading', examGrading);
-// app.use('/api/grading', gradingRoutes);
-// app.use('/api/analytics', analyticsRoutes);
-// app.use('/api/disciplinary', discplinaryRoutes);
-// app.use('/api/communications', communicationRoutes);
-// app.use('/api/events', eventsRoutes);
-// app.use('/api/users', usersRoutes);
-// app.use('/api/inventory', inventoryRoutes);
-// app.use('/api/finance', financeRoutes);
-// app.use('/api/yearly', yearlyRoutes);
-// app.use('/api/password', passwordMgt);
-// app.use('/api/academic-settings', academicSettingsRoutes);
-// app.use('/api/examinations', examinationSettingsRoutes);
-// app.use('/api/school-structure', schoolStructuresRoutes);
-// app.use('/api/subjects-settings', subjectSettings);
 
 // Error handling
 app.use(errorHandler);

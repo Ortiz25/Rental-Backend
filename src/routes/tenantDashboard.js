@@ -4,8 +4,46 @@ import {
   authenticateToken,
   authenticateTokenSimple,
 } from "../middleware/auth.js";
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs';
 
 const router = express.Router();
+
+// Configure multer for maintenance photos
+const maintenancePhotoStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const uploadDir = 'uploads/maintenance-photos/';
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, 'maintenance-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const uploadMaintenancePhotos = multer({
+  storage: maintenancePhotoStorage,
+  limits: {
+    fileSize: 5 * 1024 * 1024 // 5MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = /jpeg|jpg|png|gif|webp/;
+    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedTypes.test(file.mimetype);
+    
+    if (mimetype && extname) {
+      return cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed (jpeg, jpg, png, gif, webp)'));
+    }
+  }
+});
+
+
 
 // Tenant Dashboard Data Route
 router.get("/tenant/dashboard", authenticateTokenSimple, async (req, res) => {
@@ -120,24 +158,42 @@ LIMIT 20
     `;
 
     // Get maintenance requests
-    const maintenanceQuery = `
-      SELECT 
-        mr.id,
-        mr.request_title as title,
-        mr.description,
-        mr.priority,
-        mr.status,
-        mr.requested_date as submitted,
-        mr.scheduled_date as scheduled,
-        mr.completed_date,
-        mr.category,
-        mr.tenant_notes,
-        mr.management_notes
-      FROM maintenance_requests mr
-      WHERE mr.tenant_id = $1
-      ORDER BY mr.requested_date DESC
-      LIMIT 10
-    `;
+   // Get maintenance requests with photos
+const maintenanceQuery = `
+  SELECT 
+    mr.id,
+    mr.request_title as title,
+    mr.description,
+    mr.priority,
+    mr.status,
+    mr.requested_date as submitted,
+    mr.scheduled_date as scheduled,
+    mr.completed_date,
+    mr.category,
+    mr.tenant_notes,
+    mr.management_notes,
+    -- ADD THIS: Get photos for each maintenance request
+    (
+      SELECT json_agg(
+        json_build_object(
+          'id', p.id,
+          'fileName', p.file_name,
+          'filePath', p.file_path,
+          'fileSize', p.file_size,
+          'mimeType', p.mime_type,
+          'uploadedAt', p.uploaded_at,
+          'isBeforePhoto', p.is_before_photo
+        )
+        ORDER BY p.display_order, p.uploaded_at DESC
+      )
+      FROM maintenance_request_photos p
+      WHERE p.maintenance_request_id = mr.id
+    ) as photos
+  FROM maintenance_requests mr
+  WHERE mr.tenant_id = $1
+  ORDER BY mr.requested_date DESC
+  LIMIT 10
+`;
 
     // Get notifications
     const notificationsQuery = `
@@ -713,6 +769,8 @@ router.get(
 );
 
 // Submit maintenance request route
+
+// Submit maintenance request route
 router.post(
   "/tenant/maintenance",
   authenticateTokenSimple,
@@ -720,8 +778,24 @@ router.post(
     const client = await pool.connect();
 
     try {
-      const { title, description, priority, category } = req.body;
+      // Handle both nested and flat request data structures
+      let requestData = req.body;
+      
+      // If data is nested under 'requestData', extract it
+      if (req.body.requestData) {
+        requestData = req.body.requestData;
+      }
+
+      const { title, description, priority, category } = requestData;
       const tenantId = req.user.tenant_id;
+
+      // Validate required fields
+      if (!title || !description || !priority || !category) {
+        return res.status(400).json({
+          status: 400,
+          message: "Missing required fields: title, description, priority, and category are required",
+        });
+      }
 
       if (!tenantId) {
         return res.status(403).json({
@@ -733,12 +807,12 @@ router.post(
 
       // Get tenant's current unit
       const unitQuery = `
-      SELECT l.unit_id, l.id as lease_id
-      FROM leases l
-      JOIN lease_tenants lt ON l.id = lt.lease_id AND lt.removed_date IS NULL
-      WHERE lt.tenant_id = $1 AND l.lease_status = 'active'
-      LIMIT 1
-    `;
+        SELECT l.unit_id, l.id as lease_id
+        FROM leases l
+        JOIN lease_tenants lt ON l.id = lt.lease_id AND lt.removed_date IS NULL
+        WHERE lt.tenant_id = $1 AND l.lease_status = 'active'
+        LIMIT 1
+      `;
 
       const unitResult = await client.query(unitQuery, [tenantId]);
 
@@ -753,11 +827,11 @@ router.post(
 
       // Insert maintenance request
       const insertQuery = `
-      INSERT INTO maintenance_requests 
-      (unit_id, tenant_id, lease_id, request_title, description, priority, category, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, 'open')
-      RETURNING id, requested_date
-    `;
+        INSERT INTO maintenance_requests 
+        (unit_id, tenant_id, lease_id, request_title, description, priority, category, status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'open')
+        RETURNING id, requested_date, request_title, description, priority, category, status
+      `;
 
       const result = await client.query(insertQuery, [
         unit_id,
@@ -765,24 +839,40 @@ router.post(
         lease_id,
         title,
         description,
-        priority.toLowerCase(),
+        priority.toLowerCase(), // Safe to use toLowerCase now after validation
         category,
       ]);
 
       // Log the activity
       const logQuery = `
-      INSERT INTO user_activity_log (user_id, activity_type, activity_description)
-      VALUES ($1, 'maintenance_request', 'Submitted maintenance request: ${title}')
-    `;
+        INSERT INTO user_activity_log (user_id, activity_type, activity_description)
+        VALUES ($1, 'maintenance_request', $2)
+      `;
 
-      await client.query(logQuery, [req.user.id]);
+      await client.query(logQuery, [
+        req.user.id, 
+        `Submitted maintenance request: ${title}`
+      ]);
+
+      // Return the full maintenance request data including the ID
+      const maintenanceRequest = result.rows[0];
 
       res.status(201).json({
         status: 201,
         message: "Maintenance request submitted successfully",
         data: {
-          requestId: result.rows[0].id,
-          submittedDate: result.rows[0].requested_date,
+          id: maintenanceRequest.id,  // IMPORTANT: Include the ID for photo uploads
+          requestId: maintenanceRequest.id,
+          submittedDate: maintenanceRequest.requested_date,
+          request: {
+            id: maintenanceRequest.id,
+            title: maintenanceRequest.request_title,
+            description: maintenanceRequest.description,
+            priority: maintenanceRequest.priority,
+            category: maintenanceRequest.category,
+            status: maintenanceRequest.status,
+            requestedDate: maintenanceRequest.requested_date
+          }
         },
       });
     } catch (error) {
@@ -792,6 +882,105 @@ router.post(
         message: "Failed to submit maintenance request",
         error:
           process.env.NODE_ENV === "development" ? error.message : undefined,
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// Get specific maintenance request details with photos
+router.get(
+  "/tenant/maintenance/:id",
+  authenticateTokenSimple,
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      const maintenanceId = req.params.id;
+      const tenantId = req.user.tenant_id;
+
+      if (!tenantId) {
+        return res.status(403).json({
+          status: 403,
+          message: "Access denied. User is not associated with a tenant account.",
+        });
+      }
+
+      // Get maintenance request with photos
+      const requestQuery = `
+        SELECT 
+          mr.id,
+          mr.request_title as title,
+          mr.description,
+          mr.priority,
+          mr.status,
+          mr.requested_date as submitted,
+          mr.scheduled_date as scheduled,
+          mr.completed_date,
+          mr.category,
+          mr.tenant_notes,
+          mr.management_notes,
+          mr.estimated_cost,
+          mr.actual_cost,
+          -- Get photos
+          (
+            SELECT json_agg(
+              json_build_object(
+                'id', p.id,
+                'fileName', p.file_name,
+                'filePath', p.file_path,
+                'fileSize', p.file_size,
+                'mimeType', p.mime_type,
+                'uploadedAt', p.uploaded_at,
+                'isBeforePhoto', p.is_before_photo,
+                'description', p.description
+              )
+              ORDER BY p.display_order, p.uploaded_at DESC
+            )
+            FROM maintenance_request_photos p
+            WHERE p.maintenance_request_id = mr.id
+          ) as photos,
+          -- Get updates
+          (
+            SELECT json_agg(
+              json_build_object(
+                'id', mru.id,
+                'updateText', mru.update_text,
+                'updateType', mru.update_type,
+                'createdAt', mru.created_at,
+                'isInternal', mru.is_internal
+              )
+              ORDER BY mru.created_at DESC
+            )
+            FROM maintenance_request_updates mru
+            WHERE mru.maintenance_request_id = mr.id
+          ) as updates
+        FROM maintenance_requests mr
+        WHERE mr.id = $1 AND mr.tenant_id = $2
+        LIMIT 1
+      `;
+
+      const result = await client.query(requestQuery, [maintenanceId, tenantId]);
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          status: 404,
+          message: "Maintenance request not found or access denied",
+        });
+      }
+
+      res.status(200).json({
+        status: 200,
+        message: "Maintenance request retrieved successfully",
+        data: result.rows[0],
+      });
+    } catch (error) {
+      console.error("❌ Maintenance request fetch error:", error);
+      res.status(500).json({
+        status: 500,
+        message: "Failed to fetch maintenance request",
+        error: process.env.NODE_ENV === "development" ? error.message : undefined,
       });
     } finally {
       client.release();
