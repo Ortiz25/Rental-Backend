@@ -234,10 +234,18 @@ router.get("/", authenticateTokenSimple, async (req, res) => {
   photos: request.photos || [],
   photoCount: request.photos ? request.photos.length : 0,
 
-      // Property details
-      property: request.property_name,
+      // Property details (as object for consistency)
+      property: {
+        id: request.property_id,
+        name: request.property_name,
+      },
       propertyId: request.property_id,
-      unit: request.unit_number,
+      
+      // Unit details (as object for consistency)
+      unit: {
+        id: request.unit_id,
+        number: request.unit_number,
+      },
       unitId: request.unit_id,
 
       // Tenant details
@@ -596,6 +604,10 @@ router.get("/:id", authenticateTokenSimple, async (req, res) => {
 
       // Updates from maintenance_request_updates table (primary source)
       updates: request.updates || [],
+
+      // Photos
+      photos: request.photos || [],
+      photoCount: request.photos ? request.photos.length : 0,
 
       // Legacy updates from communications and management notes
       legacyUpdates: allUpdates.map((update) => ({
@@ -1982,10 +1994,9 @@ router.delete("/photos/:photoId", authenticateTokenSimple, async (req, res) => {
   }
 });
 
-// Serve photo file
+// Serve photo file (public - no auth required for img tags)
 router.get(
   "/photos/:photoId/file",
-  authenticateTokenSimple,
   async (req, res) => {
     const client = await pool.connect();
 
@@ -2013,6 +2024,10 @@ router.get(
         });
       }
 
+      // Set CORS headers to allow cross-origin image loading
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET");
+      res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
       res.setHeader("Content-Type", photo.mime_type);
       res.sendFile(path.resolve(photo.file_path));
     } catch (error) {
