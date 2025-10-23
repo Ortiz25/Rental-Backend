@@ -8,23 +8,14 @@ import {
 
 const router = express.Router();
 
-// Financial Summary - Main metrics for dashboard
+
 router.get("/summary", authenticateTokenSimple, async (req, res) => {
-  console.log("📊 Financial summary route accessed by user:", req.user?.id);
+  console.log("📊 Financial summary requested by user:", req.user?.id);
 
   const client = await pool.connect();
 
   try {
-    const allowedRoles = ["Super Admin", "Admin", "Manager"];
-    if (req.user.role && !allowedRoles.includes(req.user.role)) {
-      console.log(
-        "⚠️  User role not in preferred list but allowing access:",
-        req.user.role
-      );
-    }
-
-    // Get date range and property filter from query params
-    const { startDate, endDate, period = "month", propertyId } = req.query;
+    const { period = "month", month, year, propertyId } = req.query;
 
     let dateFilter = "";
     let queryParams = [];
@@ -32,184 +23,236 @@ router.get("/summary", authenticateTokenSimple, async (req, res) => {
     let paramIndex = 1;
 
     // Build property filter
-    if (propertyId) {
+    if (propertyId && propertyId !== "all") {
       propertyFilter = `AND u.property_id = $${paramIndex}`;
       queryParams.push(propertyId);
       paramIndex++;
     }
 
-    // Build date filter
-    if (startDate && endDate) {
-      dateFilter = `AND payment_date BETWEEN $${paramIndex} AND $${paramIndex + 1}`;
-      queryParams.push(startDate, endDate);
-      paramIndex += 2;
-    } else if (period === "month") {
-      dateFilter = `AND payment_date >= DATE_TRUNC('month', CURRENT_DATE)`;
-    } else if (period === "quarter") {
-      dateFilter = `AND payment_date >= DATE_TRUNC('quarter', CURRENT_DATE)`;
-    } else if (period === "year") {
-      dateFilter = `AND payment_date >= DATE_TRUNC('year', CURRENT_DATE)`;
+    // Build date filter based on period
+    if (month && year) {
+      // Specific month filter
+      const monthNumber = typeof month === 'string' && isNaN(month) 
+        ? getMonthNumber(month) 
+        : parseInt(month);
+      
+      dateFilter = `AND EXTRACT(MONTH FROM rp.payment_date) = ${monthNumber} 
+                    AND EXTRACT(YEAR FROM rp.payment_date) = ${year}`;
+    } else {
+      switch (period) {
+        case "month":
+          dateFilter = `AND rp.payment_date >= DATE_TRUNC('month', CURRENT_DATE) 
+                        AND rp.payment_date < DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'`;
+          break;
+        case "quarter":
+          dateFilter = `AND rp.payment_date >= DATE_TRUNC('quarter', CURRENT_DATE) 
+                        AND rp.payment_date < DATE_TRUNC('quarter', CURRENT_DATE) + INTERVAL '3 months'`;
+          break;
+        case "year":
+          dateFilter = `AND rp.payment_date >= DATE_TRUNC('year', CURRENT_DATE) 
+                        AND rp.payment_date < DATE_TRUNC('year', CURRENT_DATE) + INTERVAL '1 year'`;
+          break;
+        default:
+          dateFilter = `AND rp.payment_date >= DATE_TRUNC('month', CURRENT_DATE) 
+                        AND rp.payment_date < DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'`;
+      }
     }
 
-    // Total Revenue Query with property filter
+    // Query 1: Revenue (Total Rent Collected)
     const revenueQuery = `
-      SELECT 
-        COALESCE(SUM(rp.amount_paid), 0) as total_revenue,
-        COALESCE(SUM(CASE WHEN rp.payment_date >= CURRENT_DATE - INTERVAL '30 days' THEN rp.amount_paid END), 0) as revenue_last_30_days,
-        COALESCE(SUM(CASE WHEN rp.payment_date >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') 
-            AND rp.payment_date < DATE_TRUNC('month', CURRENT_DATE) THEN rp.amount_paid END), 0) as revenue_previous_month
+      SELECT COALESCE(SUM(rp.amount_paid), 0) as total_revenue
       FROM rent_payments rp
       LEFT JOIN leases l ON rp.lease_id = l.id
       LEFT JOIN units u ON l.unit_id = u.id
-      WHERE rp.payment_status = 'paid' ${dateFilter} ${propertyFilter}
+      WHERE rp.payment_status = 'paid'
+      ${dateFilter}
+      ${propertyFilter}
     `;
 
-    // Total Expenses Query with property filter
+    // Query 2: Expenses (Maintenance costs for the period)
+    const maintenanceExpenseFilter = dateFilter.replace(/rp\.payment_date/g, 'mr.completed_date');
+    
     const expensesQuery = `
-      SELECT 
-        COALESCE(SUM(COALESCE(mr.actual_cost, mr.estimated_cost)), 0) as total_expenses,
-        COALESCE(SUM(CASE WHEN COALESCE(mr.completed_date, mr.requested_date) >= CURRENT_DATE - INTERVAL '30 days' 
-            THEN COALESCE(mr.actual_cost, mr.estimated_cost) END), 0) as expenses_last_30_days,
-        COALESCE(SUM(CASE WHEN COALESCE(mr.completed_date, mr.requested_date) >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') 
-            AND COALESCE(mr.completed_date, mr.requested_date) < DATE_TRUNC('month', CURRENT_DATE) 
-            THEN COALESCE(mr.actual_cost, mr.estimated_cost) END), 0) as expenses_previous_month
+      SELECT COALESCE(SUM(COALESCE(mr.actual_cost, mr.estimated_cost)), 0) as total_expenses
       FROM maintenance_requests mr
       LEFT JOIN units u ON mr.unit_id = u.id
-      WHERE (mr.actual_cost IS NOT NULL OR mr.estimated_cost IS NOT NULL)
-      ${dateFilter.replace("payment_date", "COALESCE(completed_date, requested_date)")}
+      WHERE mr.status = 'completed'
+      AND mr.completed_date IS NOT NULL
+      ${maintenanceExpenseFilter}
       ${propertyFilter}
     `;
 
-    // Occupancy Rate Query with property filter
-    const occupancyQuery = `
-      SELECT 
-        COUNT(CASE WHEN occupancy_status = 'occupied' THEN 1 END) as occupied_units,
-        COUNT(*) as total_units,
-        CASE 
-          WHEN COUNT(*) > 0 THEN 
-            ROUND((COUNT(CASE WHEN occupancy_status = 'occupied' THEN 1 END)::DECIMAL / COUNT(*)) * 100, 2)
-          ELSE 0
-        END as occupancy_rate
-      FROM units
-      ${propertyId ? `WHERE property_id = $${queryParams.indexOf(propertyId) + 1}` : ""}
-    `;
-
-    // Pending Payments Query with property filter
-    const pendingQuery = `
-      SELECT 
-        COALESCE(SUM(rp.amount_due - rp.amount_paid), 0) as pending_payments
-      FROM rent_payments rp
-      LEFT JOIN leases l ON rp.lease_id = l.id
-      LEFT JOIN units u ON l.unit_id = u.id
-      WHERE rp.payment_status IN ('pending', 'overdue', 'partial')
-      ${propertyFilter}
-    `;
-
-    // Maintenance Costs Query with property filter
-    const maintenanceQuery = `
-      SELECT 
-  COALESCE(SUM(COALESCE(mr.actual_cost, mr.estimated_cost)), 0) AS maintenance_costs
-FROM maintenance_requests mr
-LEFT JOIN units u ON mr.unit_id = u.id
-WHERE mr.status = 'completed'
-  AND (mr.actual_cost IS NOT NULL OR mr.estimated_cost IS NOT NULL)
-  AND (COALESCE(mr.completed_date, mr.requested_date) >= DATE_TRUNC('month', CURRENT_DATE))
-  ${propertyFilter};
-
-    `;
-
-    // Property Expenses Query with property filter
-    const propertyExpensesQuery = `
-      SELECT 
-        COALESCE(SUM(
+    // Query 3: Property Expenses (for the period)
+    let propertyExpensesQuery;
+    
+    if (month && year) {
+      const monthNumber = typeof month === 'string' && isNaN(month) 
+        ? getMonthNumber(month) 
+        : parseInt(month);
+      
+      propertyExpensesQuery = `
+        SELECT COALESCE(SUM(
           CASE 
-            WHEN frequency = 'monthly' THEN amount
-            WHEN frequency = 'quarterly' THEN amount / 3
-            WHEN frequency = 'annual' THEN amount / 12
-            WHEN frequency = 'one-time' AND start_date BETWEEN DATE_TRUNC('month', CURRENT_DATE) AND CURRENT_DATE THEN amount
+            WHEN pe.frequency = 'monthly' THEN pe.amount
+            WHEN pe.frequency = 'quarterly' THEN 
+              CASE WHEN ${monthNumber} IN (1,4,7,10) THEN pe.amount ELSE 0 END
+            WHEN pe.frequency = 'annual' THEN 
+              CASE WHEN ${monthNumber} = 1 THEN pe.amount ELSE 0 END
+            WHEN pe.frequency = 'one-time' THEN pe.amount
             ELSE 0
           END
         ), 0) as property_expenses
-      FROM property_expenses
-      WHERE is_active = true
-      AND (end_date IS NULL OR end_date >= CURRENT_DATE)
-      AND start_date <= CURRENT_DATE
-      ${propertyId ? `AND property_id = $${queryParams.indexOf(propertyId) + 1}` : ""}
+        FROM property_expenses pe
+        ${propertyId && propertyId !== "all" ? `WHERE pe.property_id = $${queryParams.indexOf(propertyId) + 1}` : ''}
+      `;
+    } else {
+      // For month/quarter/year periods, calculate proportionally
+      let monthsInPeriod = 1;
+      switch (period) {
+        case "month": monthsInPeriod = 1; break;
+        case "quarter": monthsInPeriod = 3; break;
+        case "year": monthsInPeriod = 12; break;
+      }
+
+      propertyExpensesQuery = `
+        SELECT COALESCE(SUM(
+          CASE 
+            WHEN pe.frequency = 'monthly' THEN pe.amount * ${monthsInPeriod}
+            WHEN pe.frequency = 'quarterly' THEN 
+              CASE 
+                WHEN ${monthsInPeriod} >= 3 THEN pe.amount * (${monthsInPeriod} / 3)
+                ELSE 0
+              END
+            WHEN pe.frequency = 'annual' THEN 
+              CASE 
+                WHEN ${monthsInPeriod} >= 12 THEN pe.amount
+                ELSE pe.amount * (${monthsInPeriod} / 12.0)
+              END
+            WHEN pe.frequency = 'one-time' THEN pe.amount
+            ELSE 0
+          END
+        ), 0) as property_expenses
+        FROM property_expenses pe
+        WHERE pe.is_active = true
+        ${propertyId && propertyId !== "all" ? `AND pe.property_id = $${queryParams.indexOf(propertyId) + 1}` : ''}
+      `;
+    }
+
+    // Query 4: Pending Payments
+    const pendingPaymentsQuery = `
+      SELECT COALESCE(SUM(rp.amount_due - rp.amount_paid), 0) as pending_payments
+      FROM rent_payments rp
+      LEFT JOIN leases l ON rp.lease_id = l.id
+      LEFT JOIN units u ON l.unit_id = u.id
+      WHERE rp.payment_status IN ('pending', 'partial', 'overdue')
+      ${propertyFilter}
+    `;
+
+    // Query 5: Occupancy Rate
+    const occupancyQuery = `
+      SELECT 
+        COUNT(DISTINCT u.id) as total_units,
+        COUNT(DISTINCT CASE WHEN u.occupancy_status = 'occupied' THEN u.id END) as occupied_units,
+        CASE 
+          WHEN COUNT(DISTINCT u.id) > 0 THEN
+            ROUND((COUNT(DISTINCT CASE WHEN u.occupancy_status = 'occupied' THEN u.id END)::DECIMAL / 
+                   COUNT(DISTINCT u.id)) * 100, 2)
+          ELSE 0
+        END as occupancy_rate
+      FROM units u
+      ${propertyId && propertyId !== "all" ? `WHERE u.property_id = $${queryParams.indexOf(propertyId) + 1}` : ''}
     `;
 
     // Execute all queries
     const [
       revenueResult,
       expensesResult,
-      occupancyResult,
-      pendingResult,
-      maintenanceResult,
       propertyExpensesResult,
+      pendingPaymentsResult,
+      occupancyResult
     ] = await Promise.all([
       client.query(revenueQuery, queryParams),
       client.query(expensesQuery, queryParams),
-      client.query(occupancyQuery, propertyId ? [propertyId] : []),
-      client.query(pendingQuery, propertyId ? [propertyId] : []),
-      client.query(maintenanceQuery, propertyId ? [propertyId] : []),
-      client.query(propertyExpensesQuery, propertyId ? [propertyId] : []),
+      client.query(propertyExpensesQuery, queryParams),
+      client.query(pendingPaymentsQuery, queryParams),
+      client.query(occupancyQuery, queryParams)
     ]);
 
-    const maintenanceExpenses =
-      parseFloat(expensesResult.rows[0].total_expenses) || 0;
-    const propertyExpenses =
-      parseFloat(propertyExpensesResult.rows[0].property_expenses) || 0;
+    // Calculate totals
+    const totalRevenue = parseFloat(revenueResult.rows[0].total_revenue) || 0;
+    const maintenanceExpenses = parseFloat(expensesResult.rows[0].total_expenses) || 0;
+    const propertyExpenses = parseFloat(propertyExpensesResult.rows[0].property_expenses) || 0;
     const totalExpenses = maintenanceExpenses + propertyExpenses;
+    const netIncome = totalRevenue - totalExpenses;
+    const pendingPayments = parseFloat(pendingPaymentsResult.rows[0].pending_payments) || 0;
+    const occupancyRate = parseFloat(occupancyResult.rows[0].occupancy_rate) || 0;
 
-    const revenue = parseFloat(revenueResult.rows[0].total_revenue) || 0;
-    const revenueLastMonth =
-      parseFloat(revenueResult.rows[0].revenue_previous_month) || 0;
-    const expensesLastMonth =
-      parseFloat(expensesResult.rows[0].expenses_previous_month) || 0;
+    console.log("📊 Summary calculated:", {
+      period,
+      month,
+      year,
+      propertyId,
+      totalRevenue,
+      maintenanceExpenses,
+      propertyExpenses,
+      totalExpenses,
+      netIncome
+    });
 
-    // Calculate percentage changes
-    const revenueChange =
-      revenueLastMonth > 0
-        ? (((revenue - revenueLastMonth) / revenueLastMonth) * 100).toFixed(1)
-        : 0;
-    const expenseChange =
-      expensesLastMonth > 0
-        ? (
-            ((totalExpenses - expensesLastMonth) / expensesLastMonth) *
-            100
-          ).toFixed(1)
-        : 0;
-
+    // Build response
     const summary = {
-      totalRevenue: revenue,
-      totalExpenses: totalExpenses,
-      netIncome: revenue - totalExpenses,
-      occupancyRate: parseFloat(occupancyResult.rows[0].occupancy_rate) || 0,
-      pendingPayments: parseFloat(pendingResult.rows[0].pending_payments) || 0,
-      maintenanceCosts:
-        parseFloat(maintenanceResult.rows[0].maintenance_costs) || 0,
+      totalRevenue,
+      totalExpenses,
+      maintenanceExpenses,
+      propertyExpenses,
+      netIncome,
+      pendingPayments,
+      maintenanceCosts: maintenanceExpenses,
+      occupancyRate,
       changes: {
-        revenue: parseFloat(revenueChange),
-        expenses: parseFloat(expenseChange),
-        netIncome: parseFloat(revenueChange) - parseFloat(expenseChange),
-      },
+        revenue: 0,
+        expenses: 0,
+        netIncome: 0
+      }
     };
 
     res.status(200).json({
       status: 200,
       message: "Financial summary retrieved successfully",
-      data: { summary },
+      data: { summary }
     });
+
   } catch (error) {
     console.error("❌ Financial summary error:", error);
     res.status(500).json({
       status: 500,
       message: "Failed to fetch financial summary",
-      error: process.env.NODE_ENV === "development" ? error.message : undefined,
+      error: process.env.NODE_ENV === "development" ? error.message : undefined
     });
   } finally {
     client.release();
   }
 });
+
+// Helper function to convert month names to numbers
+function getMonthNumber(monthName) {
+  const months = {
+    'january': 1, 'jan': 1,
+    'february': 2, 'feb': 2,
+    'march': 3, 'mar': 3,
+    'april': 4, 'apr': 4,
+    'may': 5,
+    'june': 6, 'jun': 6,
+    'july': 7, 'jul': 7,
+    'august': 8, 'aug': 8,
+    'september': 9, 'sep': 9, 'sept': 9,
+    'october': 10, 'oct': 10,
+    'november': 11, 'nov': 11,
+    'december': 12, 'dec': 12
+  };
+  
+  return months[monthName.toLowerCase()] || 1;
+}
 
 // Monthly Data for Charts
 router.get("/monthly-data", authenticateTokenSimple, async (req, res) => {
