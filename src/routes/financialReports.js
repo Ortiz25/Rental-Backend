@@ -17,7 +17,10 @@ router.get("/summary", authenticateTokenSimple, async (req, res) => {
   try {
     const allowedRoles = ["Super Admin", "Admin", "Manager"];
     if (req.user.role && !allowedRoles.includes(req.user.role)) {
-      console.log("⚠️  User role not in preferred list but allowing access:", req.user.role);
+      console.log(
+        "⚠️  User role not in preferred list but allowing access:",
+        req.user.role
+      );
     }
 
     // Get date range and property filter from query params
@@ -88,7 +91,7 @@ router.get("/summary", authenticateTokenSimple, async (req, res) => {
           ELSE 0
         END as occupancy_rate
       FROM units
-      ${propertyId ? `WHERE property_id = $${queryParams.indexOf(propertyId) + 1}` : ''}
+      ${propertyId ? `WHERE property_id = $${queryParams.indexOf(propertyId) + 1}` : ""}
     `;
 
     // Pending Payments Query with property filter
@@ -105,12 +108,14 @@ router.get("/summary", authenticateTokenSimple, async (req, res) => {
     // Maintenance Costs Query with property filter
     const maintenanceQuery = `
       SELECT 
-        COALESCE(SUM(COALESCE(mr.actual_cost, mr.estimated_cost)), 0) as maintenance_costs
-      FROM maintenance_requests mr
-      LEFT JOIN units u ON mr.unit_id = u.id
-      WHERE (mr.actual_cost IS NOT NULL OR mr.estimated_cost IS NOT NULL)
-      AND (COALESCE(mr.completed_date, mr.requested_date) >= DATE_TRUNC('month', CURRENT_DATE))
-      ${propertyFilter}
+  COALESCE(SUM(COALESCE(mr.actual_cost, mr.estimated_cost)), 0) AS maintenance_costs
+FROM maintenance_requests mr
+LEFT JOIN units u ON mr.unit_id = u.id
+WHERE mr.status = 'completed'
+  AND (mr.actual_cost IS NOT NULL OR mr.estimated_cost IS NOT NULL)
+  AND (COALESCE(mr.completed_date, mr.requested_date) >= DATE_TRUNC('month', CURRENT_DATE))
+  ${propertyFilter};
+
     `;
 
     // Property Expenses Query with property filter
@@ -129,7 +134,7 @@ router.get("/summary", authenticateTokenSimple, async (req, res) => {
       WHERE is_active = true
       AND (end_date IS NULL OR end_date >= CURRENT_DATE)
       AND start_date <= CURRENT_DATE
-      ${propertyId ? `AND property_id = $${queryParams.indexOf(propertyId) + 1}` : ''}
+      ${propertyId ? `AND property_id = $${queryParams.indexOf(propertyId) + 1}` : ""}
     `;
 
     // Execute all queries
@@ -149,21 +154,30 @@ router.get("/summary", authenticateTokenSimple, async (req, res) => {
       client.query(propertyExpensesQuery, propertyId ? [propertyId] : []),
     ]);
 
-    const maintenanceExpenses = parseFloat(expensesResult.rows[0].total_expenses) || 0;
-    const propertyExpenses = parseFloat(propertyExpensesResult.rows[0].property_expenses) || 0;
+    const maintenanceExpenses =
+      parseFloat(expensesResult.rows[0].total_expenses) || 0;
+    const propertyExpenses =
+      parseFloat(propertyExpensesResult.rows[0].property_expenses) || 0;
     const totalExpenses = maintenanceExpenses + propertyExpenses;
 
     const revenue = parseFloat(revenueResult.rows[0].total_revenue) || 0;
-    const revenueLastMonth = parseFloat(revenueResult.rows[0].revenue_previous_month) || 0;
-    const expensesLastMonth = parseFloat(expensesResult.rows[0].expenses_previous_month) || 0;
+    const revenueLastMonth =
+      parseFloat(revenueResult.rows[0].revenue_previous_month) || 0;
+    const expensesLastMonth =
+      parseFloat(expensesResult.rows[0].expenses_previous_month) || 0;
 
     // Calculate percentage changes
-    const revenueChange = revenueLastMonth > 0
-      ? (((revenue - revenueLastMonth) / revenueLastMonth) * 100).toFixed(1)
-      : 0;
-    const expenseChange = expensesLastMonth > 0
-      ? (((totalExpenses - expensesLastMonth) / expensesLastMonth) * 100).toFixed(1)
-      : 0;
+    const revenueChange =
+      revenueLastMonth > 0
+        ? (((revenue - revenueLastMonth) / revenueLastMonth) * 100).toFixed(1)
+        : 0;
+    const expenseChange =
+      expensesLastMonth > 0
+        ? (
+            ((totalExpenses - expensesLastMonth) / expensesLastMonth) *
+            100
+          ).toFixed(1)
+        : 0;
 
     const summary = {
       totalRevenue: revenue,
@@ -171,7 +185,8 @@ router.get("/summary", authenticateTokenSimple, async (req, res) => {
       netIncome: revenue - totalExpenses,
       occupancyRate: parseFloat(occupancyResult.rows[0].occupancy_rate) || 0,
       pendingPayments: parseFloat(pendingResult.rows[0].pending_payments) || 0,
-      maintenanceCosts: parseFloat(maintenanceResult.rows[0].maintenance_costs) || 0,
+      maintenanceCosts:
+        parseFloat(maintenanceResult.rows[0].maintenance_costs) || 0,
       changes: {
         revenue: parseFloat(revenueChange),
         expenses: parseFloat(expenseChange),
@@ -196,7 +211,6 @@ router.get("/summary", authenticateTokenSimple, async (req, res) => {
   }
 });
 
-
 // Monthly Data for Charts
 router.get("/monthly-data", authenticateTokenSimple, async (req, res) => {
   console.log("📈 Monthly financial data route accessed");
@@ -210,7 +224,7 @@ router.get("/monthly-data", authenticateTokenSimple, async (req, res) => {
     // Build property filter
     let propertyFilter = "";
     const queryParams = [];
-    
+
     if (propertyId) {
       propertyFilter = `AND u.property_id = $1`;
       queryParams.push(propertyId);
@@ -387,7 +401,7 @@ router.get("/expense-breakdown", authenticateTokenSimple, async (req, res) => {
         FROM property_expenses pe
         WHERE pe.is_active = true
         AND (pe.end_date IS NULL OR pe.end_date >= CURRENT_DATE)
-        ${propertyFilter.replace('u.property_id', 'pe.property_id')}
+        ${propertyFilter.replace("u.property_id", "pe.property_id")}
         GROUP BY pe.expense_type
         HAVING SUM(
           CASE 
@@ -433,24 +447,27 @@ router.get("/expense-breakdown", authenticateTokenSimple, async (req, res) => {
 });
 
 // Recent Transactions
-router.get("/recent-transactions", authenticateTokenSimple, async (req, res) => {
-  console.log("📋 Recent transactions route accessed");
+router.get(
+  "/recent-transactions",
+  authenticateTokenSimple,
+  async (req, res) => {
+    console.log("📋 Recent transactions route accessed");
 
-  const client = await pool.connect();
+    const client = await pool.connect();
 
-  try {
-    const { limit = 20, propertyId } = req.query;
-    const limitInt = parseInt(limit);
+    try {
+      const { limit = 20, propertyId } = req.query;
+      const limitInt = parseInt(limit);
 
-    // Build property filter
-    let propertyFilter = "";
-    const queryParams = [limitInt];
-    if (propertyId) {
-      propertyFilter = `AND p.id = $2`;
-      queryParams.push(propertyId);
-    }
+      // Build property filter
+      let propertyFilter = "";
+      const queryParams = [limitInt];
+      if (propertyId) {
+        propertyFilter = `AND p.id = $2`;
+        queryParams.push(propertyId);
+      }
 
-    const transactionsQuery = `
+      const transactionsQuery = `
       WITH payment_transactions AS (
         SELECT 
           rp.id,
@@ -495,34 +512,36 @@ router.get("/recent-transactions", authenticateTokenSimple, async (req, res) => 
       LIMIT $1
     `;
 
-    const result = await client.query(transactionsQuery, queryParams);
+      const result = await client.query(transactionsQuery, queryParams);
 
-    const recentTransactions = result.rows.map((row) => ({
-      id: row.id,
-      date: row.date,
-      description: row.description,
-      type: row.type,
-      amount: parseFloat(row.amount) || 0,
-      category: row.category,
-      paymentMethod: row.payment_method,
-    }));
+      const recentTransactions = result.rows.map((row) => ({
+        id: row.id,
+        date: row.date,
+        description: row.description,
+        type: row.type,
+        amount: parseFloat(row.amount) || 0,
+        category: row.category,
+        paymentMethod: row.payment_method,
+      }));
 
-    res.status(200).json({
-      status: 200,
-      message: "Recent transactions retrieved successfully",
-      data: { recentTransactions },
-    });
-  } catch (error) {
-    console.error("❌ Recent transactions error:", error);
-    res.status(500).json({
-      status: 500,
-      message: "Failed to fetch recent transactions",
-      error: process.env.NODE_ENV === "development" ? error.message : undefined,
-    });
-  } finally {
-    client.release();
+      res.status(200).json({
+        status: 200,
+        message: "Recent transactions retrieved successfully",
+        data: { recentTransactions },
+      });
+    } catch (error) {
+      console.error("❌ Recent transactions error:", error);
+      res.status(500).json({
+        status: 500,
+        message: "Failed to fetch recent transactions",
+        error:
+          process.env.NODE_ENV === "development" ? error.message : undefined,
+      });
+    } finally {
+      client.release();
+    }
   }
-});
+);
 
 // Analytics endpoint
 router.get("/analytics", authenticateTokenSimple, async (req, res) => {
@@ -536,7 +555,7 @@ router.get("/analytics", authenticateTokenSimple, async (req, res) => {
     let dateFilter = "";
     let propertyFilter = "";
     const queryParams = [];
-    
+
     if (propertyId) {
       propertyFilter = `AND u.property_id = $1`;
       queryParams.push(propertyId);
@@ -591,10 +610,10 @@ router.get("/analytics", authenticateTokenSimple, async (req, res) => {
             COUNT(*) as unit_count,
             COUNT(CASE WHEN occupancy_status = 'occupied' THEN 1 END) as occupied_count
           FROM units
-          ${propertyId ? `WHERE property_id = $1` : ''}
+          ${propertyId ? `WHERE property_id = $1` : ""}
           GROUP BY property_id
         ) unit_counts ON p.id = unit_counts.property_id
-        ${propertyId ? `WHERE p.id = $1` : ''}
+        ${propertyId ? `WHERE p.id = $1` : ""}
       )
       SELECT 
         ra.*, ea.*, pa.*,
@@ -618,7 +637,8 @@ router.get("/analytics", authenticateTokenSimple, async (req, res) => {
 
     const analyticsData = {
       revenueMetrics: {
-        activeLeasesWithPayments: parseInt(analytics.active_leases_with_payments) || 0,
+        activeLeasesWithPayments:
+          parseInt(analytics.active_leases_with_payments) || 0,
         averageRentAmount: parseFloat(analytics.avg_rent_amount) || 0,
         medianRent: parseFloat(analytics.median_rent) || 0,
         onTimePayments: parseInt(analytics.on_time_payments) || 0,
@@ -627,18 +647,24 @@ router.get("/analytics", authenticateTokenSimple, async (req, res) => {
         onTimePaymentRate: parseFloat(analytics.on_time_payment_rate) || 0,
       },
       expenseMetrics: {
-        totalMaintenanceRequests: parseInt(analytics.total_maintenance_requests) || 0,
+        totalMaintenanceRequests:
+          parseInt(analytics.total_maintenance_requests) || 0,
         averageMaintenanceCost: parseFloat(analytics.avg_maintenance_cost) || 0,
         emergencyCosts: parseFloat(analytics.emergency_costs) || 0,
         completedRequests: parseInt(analytics.completed_requests) || 0,
         completionRate:
           analytics.total_maintenance_requests > 0
-            ? Math.round((analytics.completed_requests / analytics.total_maintenance_requests) * 100)
+            ? Math.round(
+                (analytics.completed_requests /
+                  analytics.total_maintenance_requests) *
+                  100
+              )
             : 0,
       },
       propertyMetrics: {
         totalProperties: parseInt(analytics.total_properties) || 0,
-        averageUnitsPerProperty: parseFloat(analytics.avg_units_per_property) || 0,
+        averageUnitsPerProperty:
+          parseFloat(analytics.avg_units_per_property) || 0,
         totalOccupiedUnits: parseInt(analytics.total_occupied_units) || 0,
         totalUnits: parseInt(analytics.total_units) || 0,
         overallOccupancyRate: parseFloat(analytics.overall_occupancy_rate) || 0,
@@ -742,31 +768,34 @@ router.get("/payment-trends", authenticateTokenSimple, async (req, res) => {
 });
 
 // Property financial performance endpoint
-router.get("/property-performance", authenticateTokenSimple, async (req, res) => {
-  console.log("🏢 Property performance route accessed");
+router.get(
+  "/property-performance",
+  authenticateTokenSimple,
+  async (req, res) => {
+    console.log("🏢 Property performance route accessed");
 
-  const client = await pool.connect();
+    const client = await pool.connect();
 
-  try {
-    const { period = "month", propertyId } = req.query;
+    try {
+      const { period = "month", propertyId } = req.query;
 
-    let dateFilter = "";
-    if (period === "month") {
-      dateFilter = `AND rp.payment_date >= DATE_TRUNC('month', CURRENT_DATE)`;
-    } else if (period === "quarter") {
-      dateFilter = `AND rp.payment_date >= DATE_TRUNC('quarter', CURRENT_DATE)`;
-    } else if (period === "year") {
-      dateFilter = `AND rp.payment_date >= DATE_TRUNC('year', CURRENT_DATE)`;
-    }
+      let dateFilter = "";
+      if (period === "month") {
+        dateFilter = `AND rp.payment_date >= DATE_TRUNC('month', CURRENT_DATE)`;
+      } else if (period === "quarter") {
+        dateFilter = `AND rp.payment_date >= DATE_TRUNC('quarter', CURRENT_DATE)`;
+      } else if (period === "year") {
+        dateFilter = `AND rp.payment_date >= DATE_TRUNC('year', CURRENT_DATE)`;
+      }
 
-    let propertyFilter = "";
-    const queryParams = [];
-    if (propertyId) {
-      propertyFilter = `WHERE p.id = $1`;
-      queryParams.push(propertyId);
-    }
+      let propertyFilter = "";
+      const queryParams = [];
+      if (propertyId) {
+        propertyFilter = `WHERE p.id = $1`;
+        queryParams.push(propertyId);
+      }
 
-    const performanceQuery = `
+      const performanceQuery = `
       SELECT 
         p.id, p.property_name, p.property_type,
         COUNT(DISTINCT u.id) as total_units,
@@ -796,41 +825,46 @@ router.get("/property-performance", authenticateTokenSimple, async (req, res) =>
       ORDER BY total_revenue DESC
     `;
 
-    const result = await client.query(performanceQuery, queryParams);
+      const result = await client.query(performanceQuery, queryParams);
 
-    const propertyPerformance = result.rows.map((row) => ({
-      propertyId: row.id,
-      propertyName: row.property_name,
-      propertyType: row.property_type,
-      totalUnits: parseInt(row.total_units) || 0,
-      occupiedUnits: parseInt(row.occupied_units) || 0,
-      vacantUnits: parseInt(row.vacant_units) || 0,
-      occupancyRate: parseFloat(row.occupancy_rate) || 0,
-      totalRevenue: parseFloat(row.total_revenue) || 0,
-      averageRentPerUnit: parseFloat(row.avg_rent_per_unit) || 0,
-      maintenanceCosts: parseFloat(row.maintenance_costs) || 0,
-      netIncome: parseFloat(row.net_income) || 0,
-      paymentCount: parseInt(row.payment_count) || 0,
-      maintenanceRequestCount: parseInt(row.maintenance_request_count) || 0,
-      profitMargin: row.total_revenue > 0 ? Math.round((row.net_income / row.total_revenue) * 100) : 0,
-    }));
+      const propertyPerformance = result.rows.map((row) => ({
+        propertyId: row.id,
+        propertyName: row.property_name,
+        propertyType: row.property_type,
+        totalUnits: parseInt(row.total_units) || 0,
+        occupiedUnits: parseInt(row.occupied_units) || 0,
+        vacantUnits: parseInt(row.vacant_units) || 0,
+        occupancyRate: parseFloat(row.occupancy_rate) || 0,
+        totalRevenue: parseFloat(row.total_revenue) || 0,
+        averageRentPerUnit: parseFloat(row.avg_rent_per_unit) || 0,
+        maintenanceCosts: parseFloat(row.maintenance_costs) || 0,
+        netIncome: parseFloat(row.net_income) || 0,
+        paymentCount: parseInt(row.payment_count) || 0,
+        maintenanceRequestCount: parseInt(row.maintenance_request_count) || 0,
+        profitMargin:
+          row.total_revenue > 0
+            ? Math.round((row.net_income / row.total_revenue) * 100)
+            : 0,
+      }));
 
-    res.status(200).json({
-      status: 200,
-      message: "Property performance retrieved successfully",
-      data: { propertyPerformance, period },
-    });
-  } catch (error) {
-    console.error("❌ Property performance error:", error);
-    res.status(500).json({
-      status: 500,
-      message: "Failed to fetch property performance",
-      error: process.env.NODE_ENV === "development" ? error.message : undefined,
-    });
-  } finally {
-    client.release();
+      res.status(200).json({
+        status: 200,
+        message: "Property performance retrieved successfully",
+        data: { propertyPerformance, period },
+      });
+    } catch (error) {
+      console.error("❌ Property performance error:", error);
+      res.status(500).json({
+        status: 500,
+        message: "Failed to fetch property performance",
+        error:
+          process.env.NODE_ENV === "development" ? error.message : undefined,
+      });
+    } finally {
+      client.release();
+    }
   }
-});
+);
 
 // Generate Financial Report
 router.post("/generate-report", authenticateTokenSimple, async (req, res) => {
@@ -839,7 +873,13 @@ router.post("/generate-report", authenticateTokenSimple, async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const { startDate, endDate, type = "detailed", includeCharts = true, propertyId = "all" } = req.body;
+    const {
+      startDate,
+      endDate,
+      type = "detailed",
+      includeCharts = true,
+      propertyId = "all",
+    } = req.body;
 
     if (!startDate || !endDate) {
       return res.status(400).json({
@@ -866,7 +906,10 @@ router.post("/generate-report", authenticateTokenSimple, async (req, res) => {
     }
 
     const propertyFilter = propertyId !== "all" ? "AND u.property_id = $3" : "";
-    const params = propertyId !== "all" ? [startDate, endDate, propertyId] : [startDate, endDate];
+    const params =
+      propertyId !== "all"
+        ? [startDate, endDate, propertyId]
+        : [startDate, endDate];
 
     const reportQuery = `
       WITH revenue_summary AS (
@@ -933,7 +976,8 @@ router.post("/generate-report", authenticateTokenSimple, async (req, res) => {
       generatedAt: new Date().toISOString(),
       generatedBy: req.user?.username || req.user?.email || "Unknown",
       period: { startDate, endDate },
-      propertyFilter: propertyId === "all" ? "All Properties" : `Property ID: ${propertyId}`,
+      propertyFilter:
+        propertyId === "all" ? "All Properties" : `Property ID: ${propertyId}`,
       type,
       includeCharts,
       summary: {
@@ -978,17 +1022,21 @@ router.get("/export", authenticateTokenSimple, async (req, res) => {
 
   try {
     const { format = "json", startDate, endDate, propertyId } = req.query;
-    let dateFilter = "", propertyFilter = "", queryParams = [];
+    let dateFilter = "",
+      propertyFilter = "",
+      queryParams = [];
 
     if (startDate && endDate) {
-      dateFilter = "WHERE COALESCE(mr.completed_date, mr.requested_date) BETWEEN $1 AND $2";
+      dateFilter =
+        "WHERE COALESCE(mr.completed_date, mr.requested_date) BETWEEN $1 AND $2";
       queryParams = [startDate, endDate];
     } else {
-      dateFilter = "WHERE COALESCE(mr.completed_date, mr.requested_date) >= CURRENT_DATE - INTERVAL '6 months'";
+      dateFilter =
+        "WHERE COALESCE(mr.completed_date, mr.requested_date) >= CURRENT_DATE - INTERVAL '6 months'";
     }
 
     if (propertyId) {
-      propertyFilter = `${dateFilter ? 'AND' : 'WHERE'} u.property_id = $${queryParams.length + 1}`;
+      propertyFilter = `${dateFilter ? "AND" : "WHERE"} u.property_id = $${queryParams.length + 1}`;
       queryParams.push(propertyId);
     }
 
@@ -1012,35 +1060,63 @@ router.get("/export", authenticateTokenSimple, async (req, res) => {
 
     if (format === "csv") {
       if (result.rows.length === 0) {
-        return res.status(404).json({ status: 404, message: "No data found for export" });
+        return res
+          .status(404)
+          .json({ status: 404, message: "No data found for export" });
       }
 
-      const csvHeaders = ["Request Date", "Completion Date", "Property Name", "Unit Number", 
-        "Request Title", "Category", "Priority", "Status", "Cost", "Cost Type"].join(",");
+      const csvHeaders = [
+        "Request Date",
+        "Completion Date",
+        "Property Name",
+        "Unit Number",
+        "Request Title",
+        "Category",
+        "Priority",
+        "Status",
+        "Cost",
+        "Cost Type",
+      ].join(",");
 
-      const csvRows = result.rows.map((row) => [
-        row.request_date || "", `"${(row.completion_date || "").replace(/"/g, '""')}"`,
-        `"${(row.property_name || "").replace(/"/g, '""')}"`, `"${(row.unit_number || "").replace(/"/g, '""')}"`,
-        `"${(row.request_title || "").replace(/"/g, '""')}"`, `"${(row.category || "").replace(/"/g, '""')}"`,
-        `"${(row.priority || "").replace(/"/g, '""')}"`, `"${(row.status || "").replace(/"/g, '""')}"`,
-        row.cost || 0, `"${(row.cost_type || "").replace(/"/g, '""')}"`
-      ].join(","));
+      const csvRows = result.rows.map((row) =>
+        [
+          row.request_date || "",
+          `"${(row.completion_date || "").replace(/"/g, '""')}"`,
+          `"${(row.property_name || "").replace(/"/g, '""')}"`,
+          `"${(row.unit_number || "").replace(/"/g, '""')}"`,
+          `"${(row.request_title || "").replace(/"/g, '""')}"`,
+          `"${(row.category || "").replace(/"/g, '""')}"`,
+          `"${(row.priority || "").replace(/"/g, '""')}"`,
+          `"${(row.status || "").replace(/"/g, '""')}"`,
+          row.cost || 0,
+          `"${(row.cost_type || "").replace(/"/g, '""')}"`,
+        ].join(",")
+      );
 
       const csvContent = [csvHeaders, ...csvRows].join("\n");
       res.setHeader("Content-Type", "text/csv; charset=utf-8");
-      res.setHeader("Content-Disposition", "attachment; filename=financial-report.csv");
+      res.setHeader(
+        "Content-Disposition",
+        "attachment; filename=financial-report.csv"
+      );
       res.send("\ufeff" + csvContent);
     } else {
       res.status(200).json({
-        status: 200, message: "Financial data exported successfully",
-        data: { exportData: result.rows, totalRecords: result.rows.length, dateRange: { startDate, endDate } }
+        status: 200,
+        message: "Financial data exported successfully",
+        data: {
+          exportData: result.rows,
+          totalRecords: result.rows.length,
+          dateRange: { startDate, endDate },
+        },
       });
     }
   } catch (error) {
     console.error("❌ Export error:", error);
     res.status(500).json({
-      status: 500, message: "Failed to export financial data",
-      error: process.env.NODE_ENV === "development" ? error.message : undefined
+      status: 500,
+      message: "Failed to export financial data",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   } finally {
     client.release();
@@ -1065,24 +1141,43 @@ router.get("/property-expenses", authenticateTokenSimple, async (req, res) => {
       WHERE pe.is_active = true
     `;
     const params = [];
-    if (propertyId) { query += ` AND pe.property_id = $1`; params.push(propertyId); }
+    if (propertyId) {
+      query += ` AND pe.property_id = $1`;
+      params.push(propertyId);
+    }
     query += ` ORDER BY p.property_name, pe.expense_type`;
 
     const result = await client.query(query, params);
     const propertyExpenses = result.rows.map((row) => ({
-      id: row.id, propertyId: row.property_id, propertyName: row.property_name,
-      expenseType: row.expense_type, amount: parseFloat(row.amount), frequency: row.frequency,
-      monthlyEquivalent: parseFloat(row.monthly_equivalent), startDate: row.start_date,
-      endDate: row.end_date, isActive: row.is_active, description: row.description,
-      categoryName: row.category_name, createdAt: row.created_at, updatedAt: row.updated_at
+      id: row.id,
+      propertyId: row.property_id,
+      propertyName: row.property_name,
+      expenseType: row.expense_type,
+      amount: parseFloat(row.amount),
+      frequency: row.frequency,
+      monthlyEquivalent: parseFloat(row.monthly_equivalent),
+      startDate: row.start_date,
+      endDate: row.end_date,
+      isActive: row.is_active,
+      description: row.description,
+      categoryName: row.category_name,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
     }));
 
-    res.status(200).json({ status: 200, message: "Property expenses retrieved successfully", data: { propertyExpenses } });
+    res
+      .status(200)
+      .json({
+        status: 200,
+        message: "Property expenses retrieved successfully",
+        data: { propertyExpenses },
+      });
   } catch (error) {
     console.error("❌ Property expenses error:", error);
     res.status(500).json({
-      status: 500, message: "Failed to fetch property expenses",
-      error: process.env.NODE_ENV === "development" ? error.message : undefined
+      status: 500,
+      message: "Failed to fetch property expenses",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   } finally {
     client.release();
@@ -1093,13 +1188,29 @@ router.get("/property-expenses", authenticateTokenSimple, async (req, res) => {
 router.post("/property-expenses", authenticateTokenSimple, async (req, res) => {
   const client = await pool.connect();
   try {
-    const { propertyId, expenseType, amount, frequency = "monthly", startDate, endDate, description, categoryId } = req.body;
+    const {
+      propertyId,
+      expenseType,
+      amount,
+      frequency = "monthly",
+      startDate,
+      endDate,
+      description,
+      categoryId,
+    } = req.body;
 
     if (!propertyId || !expenseType || !amount) {
-      return res.status(400).json({ status: 400, message: "Property ID, expense type, and amount are required" });
+      return res
+        .status(400)
+        .json({
+          status: 400,
+          message: "Property ID, expense type, and amount are required",
+        });
     }
     if (amount <= 0) {
-      return res.status(400).json({ status: 400, message: "Amount must be greater than 0" });
+      return res
+        .status(400)
+        .json({ status: 400, message: "Amount must be greater than 0" });
     }
 
     const insertQuery = `
@@ -1108,26 +1219,45 @@ router.post("/property-expenses", authenticateTokenSimple, async (req, res) => {
       RETURNING id, property_id, expense_type, amount, frequency, start_date, end_date, description, is_active, created_at
     `;
 
-    const params = [propertyId, expenseType, amount, frequency,
-      startDate || new Date().toISOString().split("T")[0], endDate || null,
-      description || null, categoryId || null, req.user?.username || req.user?.email || "system"];
+    const params = [
+      propertyId,
+      expenseType,
+      amount,
+      frequency,
+      startDate || new Date().toISOString().split("T")[0],
+      endDate || null,
+      description || null,
+      categoryId || null,
+      req.user?.username || req.user?.email || "system",
+    ];
 
     const result = await client.query(insertQuery, params);
     const newExpense = result.rows[0];
 
     res.status(201).json({
-      status: 201, message: "Property expense created successfully",
-      data: { expense: {
-        id: newExpense.id, propertyId: newExpense.property_id, expenseType: newExpense.expense_type,
-        amount: parseFloat(newExpense.amount), frequency: newExpense.frequency, startDate: newExpense.start_date,
-        endDate: newExpense.end_date, description: newExpense.description, isActive: newExpense.is_active, createdAt: newExpense.created_at
-      }}
+      status: 201,
+      message: "Property expense created successfully",
+      data: {
+        expense: {
+          id: newExpense.id,
+          propertyId: newExpense.property_id,
+          expenseType: newExpense.expense_type,
+          amount: parseFloat(newExpense.amount),
+          frequency: newExpense.frequency,
+          startDate: newExpense.start_date,
+          endDate: newExpense.end_date,
+          description: newExpense.description,
+          isActive: newExpense.is_active,
+          createdAt: newExpense.created_at,
+        },
+      },
     });
   } catch (error) {
     console.error("❌ Create property expense error:", error);
     res.status(500).json({
-      status: 500, message: "Failed to create property expense",
-      error: process.env.NODE_ENV === "development" ? error.message : undefined
+      status: 500,
+      message: "Failed to create property expense",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   } finally {
     client.release();
@@ -1135,88 +1265,158 @@ router.post("/property-expenses", authenticateTokenSimple, async (req, res) => {
 });
 
 // Update property expense
-router.put("/property-expenses/:id", authenticateTokenSimple, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const { id } = req.params;
-    const { expenseType, amount, frequency, startDate, endDate, description, isActive, categoryId } = req.body;
-    const updateFields = [], params = [];
-    let paramCount = 1;
+router.put(
+  "/property-expenses/:id",
+  authenticateTokenSimple,
+  async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const { id } = req.params;
+      const {
+        expenseType,
+        amount,
+        frequency,
+        startDate,
+        endDate,
+        description,
+        isActive,
+        categoryId,
+      } = req.body;
+      const updateFields = [],
+        params = [];
+      let paramCount = 1;
 
-    if (expenseType !== undefined) { updateFields.push(`expense_type = $${paramCount++}`); params.push(expenseType); }
-    if (amount !== undefined) {
-      if (amount <= 0) return res.status(400).json({ status: 400, message: "Amount must be greater than 0" });
-      updateFields.push(`amount = $${paramCount++}`); params.push(amount);
-    }
-    if (frequency !== undefined) { updateFields.push(`frequency = $${paramCount++}`); params.push(frequency); }
-    if (startDate !== undefined) { updateFields.push(`start_date = $${paramCount++}`); params.push(startDate); }
-    if (endDate !== undefined) { updateFields.push(`end_date = $${paramCount++}`); params.push(endDate); }
-    if (description !== undefined) { updateFields.push(`description = $${paramCount++}`); params.push(description); }
-    if (isActive !== undefined) { updateFields.push(`is_active = $${paramCount++}`); params.push(isActive); }
-    if (categoryId !== undefined) { updateFields.push(`category_id = $${paramCount++}`); params.push(categoryId); }
+      if (expenseType !== undefined) {
+        updateFields.push(`expense_type = $${paramCount++}`);
+        params.push(expenseType);
+      }
+      if (amount !== undefined) {
+        if (amount <= 0)
+          return res
+            .status(400)
+            .json({ status: 400, message: "Amount must be greater than 0" });
+        updateFields.push(`amount = $${paramCount++}`);
+        params.push(amount);
+      }
+      if (frequency !== undefined) {
+        updateFields.push(`frequency = $${paramCount++}`);
+        params.push(frequency);
+      }
+      if (startDate !== undefined) {
+        updateFields.push(`start_date = $${paramCount++}`);
+        params.push(startDate);
+      }
+      if (endDate !== undefined) {
+        updateFields.push(`end_date = $${paramCount++}`);
+        params.push(endDate);
+      }
+      if (description !== undefined) {
+        updateFields.push(`description = $${paramCount++}`);
+        params.push(description);
+      }
+      if (isActive !== undefined) {
+        updateFields.push(`is_active = $${paramCount++}`);
+        params.push(isActive);
+      }
+      if (categoryId !== undefined) {
+        updateFields.push(`category_id = $${paramCount++}`);
+        params.push(categoryId);
+      }
 
-    if (updateFields.length === 0) return res.status(400).json({ status: 400, message: "No fields to update" });
+      if (updateFields.length === 0)
+        return res
+          .status(400)
+          .json({ status: 400, message: "No fields to update" });
 
-    updateFields.push(`updated_at = CURRENT_TIMESTAMP`);
-    params.push(id);
+      updateFields.push(`updated_at = CURRENT_TIMESTAMP`);
+      params.push(id);
 
-    const updateQuery = `
+      const updateQuery = `
       UPDATE property_expenses SET ${updateFields.join(", ")} WHERE id = $${paramCount}
       RETURNING id, property_id, expense_type, amount, frequency, start_date, end_date, description, is_active, updated_at
     `;
 
-    const result = await client.query(updateQuery, params);
-    if (result.rows.length === 0) return res.status(404).json({ status: 404, message: "Property expense not found" });
+      const result = await client.query(updateQuery, params);
+      if (result.rows.length === 0)
+        return res
+          .status(404)
+          .json({ status: 404, message: "Property expense not found" });
 
-    const updatedExpense = result.rows[0];
-    res.status(200).json({
-      status: 200, message: "Property expense updated successfully",
-      data: { expense: {
-        id: updatedExpense.id, propertyId: updatedExpense.property_id, expenseType: updatedExpense.expense_type,
-        amount: parseFloat(updatedExpense.amount), frequency: updatedExpense.frequency, startDate: updatedExpense.start_date,
-        endDate: updatedExpense.end_date, description: updatedExpense.description, isActive: updatedExpense.is_active, updatedAt: updatedExpense.updated_at
-      }}
-    });
-  } catch (error) {
-    console.error("❌ Update property expense error:", error);
-    res.status(500).json({
-      status: 500, message: "Failed to update property expense",
-      error: process.env.NODE_ENV === "development" ? error.message : undefined
-    });
-  } finally {
-    client.release();
+      const updatedExpense = result.rows[0];
+      res.status(200).json({
+        status: 200,
+        message: "Property expense updated successfully",
+        data: {
+          expense: {
+            id: updatedExpense.id,
+            propertyId: updatedExpense.property_id,
+            expenseType: updatedExpense.expense_type,
+            amount: parseFloat(updatedExpense.amount),
+            frequency: updatedExpense.frequency,
+            startDate: updatedExpense.start_date,
+            endDate: updatedExpense.end_date,
+            description: updatedExpense.description,
+            isActive: updatedExpense.is_active,
+            updatedAt: updatedExpense.updated_at,
+          },
+        },
+      });
+    } catch (error) {
+      console.error("❌ Update property expense error:", error);
+      res.status(500).json({
+        status: 500,
+        message: "Failed to update property expense",
+        error:
+          process.env.NODE_ENV === "development" ? error.message : undefined,
+      });
+    } finally {
+      client.release();
+    }
   }
-});
+);
 
 // Delete property expense
-router.delete("/property-expenses/:id", authenticateTokenSimple, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const { id } = req.params;
-    const { hardDelete = false } = req.query;
+router.delete(
+  "/property-expenses/:id",
+  authenticateTokenSimple,
+  async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const { id } = req.params;
+      const { hardDelete = false } = req.query;
 
-    const query = hardDelete === "true"
-      ? `DELETE FROM property_expenses WHERE id = $1 RETURNING id`
-      : `UPDATE property_expenses SET is_active = false, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING id, is_active`;
+      const query =
+        hardDelete === "true"
+          ? `DELETE FROM property_expenses WHERE id = $1 RETURNING id`
+          : `UPDATE property_expenses SET is_active = false, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING id, is_active`;
 
-    const result = await client.query(query, [id]);
-    if (result.rows.length === 0) return res.status(404).json({ status: 404, message: "Property expense not found" });
+      const result = await client.query(query, [id]);
+      if (result.rows.length === 0)
+        return res
+          .status(404)
+          .json({ status: 404, message: "Property expense not found" });
 
-    res.status(200).json({
-      status: 200,
-      message: hardDelete === "true" ? "Property expense deleted permanently" : "Property expense deactivated successfully",
-      data: { id: result.rows[0].id }
-    });
-  } catch (error) {
-    console.error("❌ Delete property expense error:", error);
-    res.status(500).json({
-      status: 500, message: "Failed to delete property expense",
-      error: process.env.NODE_ENV === "development" ? error.message : undefined
-    });
-  } finally {
-    client.release();
+      res.status(200).json({
+        status: 200,
+        message:
+          hardDelete === "true"
+            ? "Property expense deleted permanently"
+            : "Property expense deactivated successfully",
+        data: { id: result.rows[0].id },
+      });
+    } catch (error) {
+      console.error("❌ Delete property expense error:", error);
+      res.status(500).json({
+        status: 500,
+        message: "Failed to delete property expense",
+        error:
+          process.env.NODE_ENV === "development" ? error.message : undefined,
+      });
+    } finally {
+      client.release();
+    }
   }
-});
+);
 
 // Get expense categories
 router.get("/expense-categories", authenticateTokenSimple, async (req, res) => {
@@ -1227,21 +1427,24 @@ router.get("/expense-categories", authenticateTokenSimple, async (req, res) => {
     const result = await client.query(query);
 
     const categories = result.rows.map((row) => ({
-      id: row.id, categoryName: row.category_name, description: row.description,
-      isActive: row.is_active, createdAt: row.created_at
+      id: row.id,
+      categoryName: row.category_name,
+      description: row.description,
+      isActive: row.is_active,
+      createdAt: row.created_at,
     }));
 
     res.status(200).json({
       status: 200,
       message: "Expense categories retrieved successfully",
-      data: { categories }
+      data: { categories },
     });
   } catch (error) {
     console.error("❌ Expense categories error:", error);
     res.status(500).json({
       status: 500,
       message: "Failed to fetch expense categories",
-      error: process.env.NODE_ENV === "development" ? error.message : undefined
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   } finally {
     client.release();
