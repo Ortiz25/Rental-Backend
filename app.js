@@ -27,6 +27,8 @@ import paymentMethodsRoutes from "./src/routes/paymentMethods.js"
 import systemSettingsRoutes from "./src/routes/systemSettings.js"
 import utilityChargesRoutes from "./src/routes/utilityCharges.js"
 import passwordMgtRoutes from "./src/routes/passwordMgt.js"
+import vacancyRoutes from "./src/routes/vacancy.js"
+import inquiryRoutes from "./src/routes/inquiries.js"
 
 const app = express();
 
@@ -65,6 +67,8 @@ app.use('/api/payment-methods', paymentMethodsRoutes)
 app.use('/api/system-settings', systemSettingsRoutes)
 app.use('/api/utility-charges', utilityChargesRoutes)
 app.use('/api/password', passwordMgtRoutes)
+app.use('/api/vacancies', vacancyRoutes)
+app.use('/api/inquiries', inquiryRoutes)
 
 
 // Error handling
