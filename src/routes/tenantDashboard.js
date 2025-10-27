@@ -768,7 +768,6 @@ router.get(
   }
 );
 
-// Submit maintenance request route
 
 // Submit maintenance request route
 router.post(
@@ -788,7 +787,7 @@ router.post(
 
       const { title, description, priority, category } = requestData;
       const tenantId = req.user.tenant_id;
-
+      console.log(requestData, tenantId)
       // Validate required fields
       if (!title || !description || !priority || !category) {
         return res.status(400).json({
@@ -815,7 +814,7 @@ router.post(
       `;
 
       const unitResult = await client.query(unitQuery, [tenantId]);
-
+       console.log(unitResult)
       if (unitResult.rows.length === 0) {
         return res.status(400).json({
           status: 400,

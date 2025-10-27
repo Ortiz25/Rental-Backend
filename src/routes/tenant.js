@@ -3081,11 +3081,13 @@ router.post("/:id/documents", authenticateTokenSimple, async (req, res) => {
   }
 });
 
-// Blacklist a tenant
+
+// Fixed both blacklisted_by and performed_by to use req.user.id instead of req.user.username
+
 router.post(
   "/:id/blacklist",
   authenticateTokenSimple,
-  authorizeRole(["Super Admin", "Admin", "Manager"]),
+  authorizeRole(["Super Admin", "Admin"]),
   async (req, res) => {
     const client = await pool.connect();
 
@@ -3093,13 +3095,7 @@ router.post(
       await client.query("BEGIN");
 
       const tenantId = req.params.id;
-      const {
-        reason,
-        severity = "medium",
-        notes,
-        evidenceDocuments = [],
-        categoryId,
-      } = req.body;
+      const { reason, notes, severity, evidenceDocuments } = req.body;
 
       // Validate required fields
       if (!reason) {
@@ -3134,7 +3130,7 @@ router.post(
         });
       }
 
-      // Update tenant blacklist status
+      // FIX #1: Update tenant blacklist status - use req.user.id instead of req.user.username
       await client.query(
         `UPDATE tenants SET 
        is_blacklisted = true,
@@ -3145,10 +3141,10 @@ router.post(
        blacklist_severity = $4,
        updated_at = CURRENT_TIMESTAMP
        WHERE id = $5`,
-        [reason, req.user.username, notes, severity, tenantId]
+        [reason, req.user.id, notes, severity, tenantId] // CHANGED: req.user.username -> req.user.id
       );
 
-      // Record in blacklist history
+      // FIX #2: Record in blacklist history - use req.user.id instead of req.user.username
       await client.query(
         `INSERT INTO tenant_blacklist_history 
        (tenant_id, action, reason, severity, notes, evidence_documents, performed_by, previous_status, ip_address)
@@ -3160,7 +3156,7 @@ router.post(
           severity,
           notes,
           evidenceDocuments,
-          req.user.username,
+          req.user.id, // CHANGED: req.user.username -> req.user.id (parameter $7)
           false,
           req.ip,
         ]
@@ -3211,8 +3207,7 @@ router.post(
   }
 );
 
-// Remove from blacklist
-// Remove from blacklist
+// ALSO FIX: Remove from blacklist endpoint
 router.post(
   "/:id/remove-blacklist",
   authenticateTokenSimple,
@@ -3259,7 +3254,7 @@ router.post(
         });
       }
 
-      // FIRST: Manually record removal in history before updating tenant
+      // FIXED: Record removal in history before updating tenant - use req.user.id
       await client.query(
         `INSERT INTO tenant_blacklist_history 
          (tenant_id, action, reason, notes, performed_by, previous_status, ip_address)
@@ -3269,13 +3264,13 @@ router.post(
           "removed",
           removalReason,
           notes,
-          req.user.username,
+          req.user.id, // CHANGED: req.user.username -> req.user.id
           true,
           req.ip,
         ]
       );
 
-      // THEN: Remove blacklist status (setting blacklisted_by to NULL is okay here)
+      // Remove blacklist status
       await client.query(
         `UPDATE tenants SET 
          is_blacklisted = false,
@@ -3332,6 +3327,9 @@ router.post(
     }
   }
 );
+
+
+
 // Get blacklist history for a tenant
 router.get(
   "/:id/blacklist-history",
