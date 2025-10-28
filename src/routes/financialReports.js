@@ -489,7 +489,9 @@ router.get("/expense-breakdown", authenticateTokenSimple, async (req, res) => {
   }
 });
 
-// Recent Transactions
+// Updated Recent Transactions Route with Property Names for ALL transactions
+// This fixes the issue where maintenance expenses didn't show property context
+
 router.get(
   "/recent-transactions",
   authenticateTokenSimple,
@@ -532,7 +534,15 @@ router.get(
         SELECT 
           mr.id,
           mr.completed_date as date,
-          mr.request_title as description,
+          mr.request_title || 
+          CASE 
+            WHEN p.property_name IS NOT NULL THEN ' - ' || p.property_name 
+            ELSE '' 
+          END ||
+          CASE 
+            WHEN u.unit_number IS NOT NULL THEN ' Unit ' || u.unit_number 
+            ELSE '' 
+          END as description,
           'Expense' as type,
           mr.actual_cost as amount,
           COALESCE(mr.category, 'Maintenance') as category,
@@ -585,6 +595,9 @@ router.get(
     }
   }
 );
+
+
+
 
 // Analytics endpoint
 router.get("/analytics", authenticateTokenSimple, async (req, res) => {

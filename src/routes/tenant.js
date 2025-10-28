@@ -1679,24 +1679,49 @@ router.get("/", authenticateTokenSimple, async (req, res) => {
 
     // Get payment history for each tenant
     const paymentHistoryQuery = `
-      SELECT 
-        rp.id,
-        rp.lease_id,
-        rp.payment_date,
-        rp.due_date,
-        rp.amount_due,
-        rp.amount_paid,
-        rp.payment_method,
-        rp.payment_status,
-        rp.late_fee,
-        l.lease_number,
-        lt.tenant_id
-      FROM rent_payments rp
-      JOIN leases l ON rp.lease_id = l.id
-      JOIN lease_tenants lt ON l.id = lt.lease_id
-      WHERE lt.removed_date IS NULL
-      ORDER BY rp.due_date DESC
-    `;
+    SELECT 
+      rp.id,
+      rp.lease_id,
+      rp.payment_date,
+      rp.due_date,
+      rp.amount_due,
+      rp.amount_paid,
+      rp.payment_method,
+      rp.payment_status,
+      rp.late_fee,
+      rp.utilities_charges,
+      rp.notes,
+      l.lease_number,
+      l.lease_status,
+      lt.tenant_id,
+      lt.removed_date,
+      
+      -- ✅ NEW: Utilities breakdown from utility_charges table
+      uc.water_charges,
+      uc.water_usage,
+      uc.electricity_charges,
+      uc.electricity_usage,
+      uc.gas_charges,
+      uc.service_charges,
+      uc.garbage_charges,
+      uc.common_area_charges,
+      uc.other_charges,
+      uc.other_charges_description,
+      uc.billing_month
+      
+    FROM rent_payments rp
+    JOIN leases l ON rp.lease_id = l.id
+    JOIN lease_tenants lt ON l.id = lt.lease_id
+    
+    -- ✅ NEW: LEFT JOIN to get utilities breakdown (may not exist for all payments)
+    LEFT JOIN utility_charges uc ON (
+      uc.lease_id = l.id 
+      AND DATE_TRUNC('month', uc.billing_month) = DATE_TRUNC('month', rp.due_date)
+    )
+    
+    -- ✅ REMOVED: WHERE lt.removed_date IS NULL (to include offboarded tenants)
+    ORDER BY rp.due_date DESC
+  `;
 
     const paymentsResult = await client.query(paymentHistoryQuery);
 
@@ -1716,12 +1741,28 @@ router.get("/", authenticateTokenSimple, async (req, res) => {
 
     const documentsResult = await client.query(documentsQuery);
 
-    // Format the response data
+    // ✅ UPDATED: Format the response data with utilities breakdown
     const paymentsByTenant = {};
     paymentsResult.rows.forEach((payment) => {
       if (!paymentsByTenant[payment.tenant_id]) {
         paymentsByTenant[payment.tenant_id] = [];
       }
+      
+      // ✅ NEW: Build utilities breakdown object
+      const utilitiesBreakdown = {};
+      if (payment.water_charges > 0) utilitiesBreakdown.water = parseFloat(payment.water_charges);
+      if (payment.electricity_charges > 0) utilitiesBreakdown.electricity = parseFloat(payment.electricity_charges);
+      if (payment.gas_charges > 0) utilitiesBreakdown.gas = parseFloat(payment.gas_charges);
+      if (payment.service_charges > 0) utilitiesBreakdown.service = parseFloat(payment.service_charges);
+      if (payment.garbage_charges > 0) utilitiesBreakdown.garbage = parseFloat(payment.garbage_charges);
+      if (payment.common_area_charges > 0) utilitiesBreakdown.commonArea = parseFloat(payment.common_area_charges);
+      if (payment.other_charges > 0) {
+        utilitiesBreakdown.other = parseFloat(payment.other_charges);
+        if (payment.other_charges_description) {
+          utilitiesBreakdown.otherDescription = payment.other_charges_description;
+        }
+      }
+      
       paymentsByTenant[payment.tenant_id].push({
         id: payment.id,
         date: payment.payment_date,
@@ -1734,9 +1775,19 @@ router.get("/", authenticateTokenSimple, async (req, res) => {
             ? "Paid"
             : payment.payment_status === "overdue"
               ? "Late"
-              : "Pending",
+              : payment.payment_status === "written_off"  // ✅ NEW: Handle written_off status
+                ? "Written Off"
+                : "Pending",
         method: payment.payment_method,
         lateFee: parseFloat(payment.late_fee) || 0,
+        
+        // ✅ NEW: Add utilities information
+        utilitiesCharges: parseFloat(payment.utilities_charges) || 0,
+        utilitiesBreakdown: Object.keys(utilitiesBreakdown).length > 0 ? utilitiesBreakdown : null,
+        
+        // ✅ NEW: Add notes for offboarding context
+        notes: payment.notes,
+        leaseStatus: payment.lease_status,
       });
     });
 
@@ -1887,6 +1938,7 @@ router.get("/", authenticateTokenSimple, async (req, res) => {
     client.release();
   }
 });
+
 
 // Create new tenant (onboarding)
 router.post("/", authenticateTokenSimple, async (req, res) => {
@@ -2675,33 +2727,93 @@ router.get("/:id/payments", authenticateTokenSimple, async (req, res) => {
   try {
     const tenantId = req.params.id;
 
+    // ✅ UPDATED: Payment history query with utilities breakdown
     const paymentsQuery = `
-        SELECT 
-          rp.id,
-          rp.payment_date,
-          rp.due_date,
-          rp.amount_due,
-          rp.amount_paid,
-          rp.payment_method,
-          rp.payment_status,
-          rp.late_fee,
-          rp.payment_reference,
-          rp.notes,
-          l.lease_number,
-          l.monthly_rent
-        FROM rent_payments rp
-        JOIN leases l ON rp.lease_id = l.id
-        JOIN lease_tenants lt ON l.id = lt.lease_id
-        WHERE lt.tenant_id = $1
-        ORDER BY rp.due_date DESC
-      `;
+      SELECT 
+        rp.id,
+        rp.payment_date,
+        rp.due_date,
+        rp.amount_due,
+        rp.amount_paid,
+        rp.payment_method,
+        rp.payment_status,
+        rp.late_fee,
+        rp.payment_reference,
+        rp.notes,
+        rp.utilities_charges,
+        l.lease_number,
+        l.monthly_rent,
+        
+        -- ✅ NEW: Utilities breakdown
+        uc.water_charges,
+        uc.water_usage,
+        uc.electricity_charges,
+        uc.electricity_usage,
+        uc.gas_charges,
+        uc.service_charges,
+        uc.garbage_charges,
+        uc.common_area_charges,
+        uc.other_charges,
+        uc.other_charges_description,
+        uc.billing_month
+        
+      FROM rent_payments rp
+      JOIN leases l ON rp.lease_id = l.id
+      JOIN lease_tenants lt ON l.id = lt.lease_id
+      
+      -- ✅ NEW: LEFT JOIN for utilities breakdown
+      LEFT JOIN utility_charges uc ON (
+        uc.lease_id = l.id 
+        AND DATE_TRUNC('month', uc.billing_month) = DATE_TRUNC('month', rp.due_date)
+      )
+      
+      WHERE lt.tenant_id = $1
+      ORDER BY rp.due_date DESC
+    `;
 
     const result = await client.query(paymentsQuery, [tenantId]);
+    
+    // ✅ UPDATED: Format response with utilities breakdown
+    const formattedPayments = result.rows.map(payment => {
+      // Build utilities breakdown object
+      const utilitiesBreakdown = {};
+      if (payment.water_charges > 0) utilitiesBreakdown.water = parseFloat(payment.water_charges);
+      if (payment.electricity_charges > 0) utilitiesBreakdown.electricity = parseFloat(payment.electricity_charges);
+      if (payment.gas_charges > 0) utilitiesBreakdown.gas = parseFloat(payment.gas_charges);
+      if (payment.service_charges > 0) utilitiesBreakdown.service = parseFloat(payment.service_charges);
+      if (payment.garbage_charges > 0) utilitiesBreakdown.garbage = parseFloat(payment.garbage_charges);
+      if (payment.common_area_charges > 0) utilitiesBreakdown.commonArea = parseFloat(payment.common_area_charges);
+      if (payment.other_charges > 0) {
+        utilitiesBreakdown.other = parseFloat(payment.other_charges);
+        if (payment.other_charges_description) {
+          utilitiesBreakdown.otherDescription = payment.other_charges_description;
+        }
+      }
+      
+      return {
+        id: payment.id,
+        paymentDate: payment.payment_date,
+        dueDate: payment.due_date,
+        amountDue: parseFloat(payment.amount_due),
+        amountPaid: parseFloat(payment.amount_paid),
+        paymentMethod: payment.payment_method,
+        paymentStatus: payment.payment_status,
+        lateFee: parseFloat(payment.late_fee) || 0,
+        paymentReference: payment.payment_reference,
+        notes: payment.notes,
+        leaseNumber: payment.lease_number,
+        monthlyRent: parseFloat(payment.monthly_rent),
+        
+        // ✅ NEW: Utilities information
+        utilitiesCharges: parseFloat(payment.utilities_charges) || 0,
+        utilitiesBreakdown: Object.keys(utilitiesBreakdown).length > 0 ? utilitiesBreakdown : null,
+      };
+    });
 
     res.status(200).json({
       status: 200,
       message: "Payment history retrieved successfully",
-      data: result.rows,
+      data: formattedPayments,
     });
   } catch (error) {
     console.error("Payment history fetch error:", error);
@@ -2715,6 +2827,8 @@ router.get("/:id/payments", authenticateTokenSimple, async (req, res) => {
     client.release();
   }
 });
+
+
 
 // GET /api/tenants/:id/documents - Get all documents for a tenant
 router.get("/:id/documents", authenticateTokenSimple, async (req, res) => {
