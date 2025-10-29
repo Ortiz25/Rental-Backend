@@ -105,6 +105,33 @@ router.post('/', loginLimiter, async (req, res) => {
       }
   
       const user = userResult.rows[0];
+
+      // Check if tenant login is enabled (for users with tenant role)
+      if (user.role_name && user.role_name.toLowerCase() === 'tenant') {
+        const tenantPortalSettingQuery = `
+          SELECT setting_value 
+          FROM system_settings 
+          WHERE setting_key = 'allow_tenant_portal'
+        `;
+        
+        const tenantPortalResult = await client.query(tenantPortalSettingQuery);
+        const isTenantPortalEnabled = tenantPortalResult.rows[0]?.setting_value === 'true';
+        
+        if (!isTenantPortalEnabled) {
+          await logUserActivity(
+            user.id,
+            'login_blocked',
+            'Tenant login attempt when tenant portal is disabled',
+            req.ip,
+            req.headers['user-agent']
+          );
+          
+          return res.status(403).json({
+            status: 403,
+            message: 'Tenant portal access is currently disabled. Please contact the administrator.'
+          });
+        }
+      }
   
       // Check if account is locked
       if (isAccountLocked(user)) {
