@@ -214,3 +214,16 @@ cron.schedule('0 3 * * *', async () => {
     }
 });
 
+
+// # Core function: mark unpaid rent as overdue
+
+cron.schedule('0 0 * * *', async () => {
+    try {
+        await pool.query('SELECT mark_overdue_rent_payments()');
+        console.log('Overdue rent payments marked');
+        
+    } catch (err) {
+        console.error('Error marking overdue rent payments:', err);
+    }
+});
+

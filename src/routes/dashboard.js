@@ -44,6 +44,12 @@ router.get("/dashboard/test", async (req, res) => {
 router.get("/summary", authenticateTokenSimple, async (req, res) => {
   console.log("📊 Dashboard summary route accessed by user:", req.user?.id);
 
+  const { month, year } = req.query;
+  const targetMonth = month ? parseInt(month) : new Date().getMonth() + 1;
+  const targetYear = year ? parseInt(year) : new Date().getFullYear();
+
+  console.log(`📅 Filtering for: ${targetYear}-${targetMonth}`);
+
   const client = await pool.connect();
 
   try {
@@ -92,112 +98,104 @@ router.get("/summary", authenticateTokenSimple, async (req, res) => {
 
     // Financial Summary Query (UPDATED - includes utilities tracking)
     const financialQuery = `
-       WITH monthly_payments AS (
-  SELECT 
-    -- Rent collected (excluding utilities)
-    COALESCE(SUM(CASE WHEN payment_status = 'paid' 
-                      AND payment_date >= DATE_TRUNC('month', CURRENT_DATE) 
-                 THEN (amount_paid - COALESCE(utilities_charges, 0)) END), 0) as collected_revenue,
-    
-    -- Utilities collected separately
-    COALESCE(SUM(CASE WHEN payment_status = 'paid' 
-                      AND payment_date >= DATE_TRUNC('month', CURRENT_DATE) 
-                 THEN COALESCE(utilities_charges, 0) END), 0) as utilities_collected,
-    
-    -- Total collected (rent + utilities)
-    COALESCE(SUM(CASE WHEN payment_status = 'paid' 
-                      AND payment_date >= DATE_TRUNC('month', CURRENT_DATE) 
-                 THEN amount_paid END), 0) as total_collected,
-
-    -- Outstanding rent (past due only)
-    COALESCE(SUM(CASE WHEN payment_status IN ('overdue', 'pending') 
-                      AND due_date < CURRENT_DATE 
-                 THEN amount_due END), 0) as outstanding_rent
-  FROM rent_payments
-),
-monthly_expected AS (
-  -- Use rent_payments records instead of leases for accurate expected revenue
-  SELECT 
-    COALESCE(SUM(amount_due), 0) as expected_revenue
-  FROM rent_payments
-  WHERE due_date >= DATE_TRUNC('month', CURRENT_DATE)
-    AND due_date < DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
-),
-monthly_maintenance AS (
-  SELECT 
-    COALESCE(SUM(CASE WHEN completed_date >= DATE_TRUNC('month', CURRENT_DATE) 
-                 THEN actual_cost END), 0) as maintenance_costs
-  FROM maintenance_requests
-  WHERE actual_cost IS NOT NULL
-),
-monthly_property_expenses AS (
-  SELECT 
-    COALESCE(SUM(
-      CASE 
-        WHEN frequency = 'monthly' AND is_active = true 
-          AND start_date <= CURRENT_DATE 
-          AND (end_date IS NULL OR end_date >= DATE_TRUNC('month', CURRENT_DATE))
-        THEN amount
+    WITH monthly_payments AS (
+      SELECT 
+        COALESCE(SUM(CASE WHEN payment_status = 'paid' 
+                          AND payment_date >= DATE_TRUNC('month', DATE($1 || '-' || LPAD($2::text, 2, '0') || '-01'))
+                          AND payment_date < DATE_TRUNC('month', DATE($1 || '-' || LPAD($2::text, 2, '0') || '-01')) + INTERVAL '1 month'
+                     THEN (amount_paid - COALESCE(utilities_charges, 0)) END), 0) as collected_revenue,
         
-        WHEN frequency = 'quarterly' AND is_active = true
-          AND start_date <= CURRENT_DATE
-          AND (end_date IS NULL OR end_date >= DATE_TRUNC('month', CURRENT_DATE))
-        THEN amount / 3.0
+        COALESCE(SUM(CASE WHEN payment_status = 'paid' 
+                          AND payment_date >= DATE_TRUNC('month', DATE($1 || '-' || LPAD($2::text, 2, '0') || '-01'))
+                          AND payment_date < DATE_TRUNC('month', DATE($1 || '-' || LPAD($2::text, 2, '0') || '-01')) + INTERVAL '1 month'
+                     THEN COALESCE(utilities_charges, 0) END), 0) as utilities_collected,
         
-        WHEN frequency = 'semi-annual' AND is_active = true
-          AND start_date <= CURRENT_DATE
-          AND (end_date IS NULL OR end_date >= DATE_TRUNC('month', CURRENT_DATE))
-        THEN amount / 6.0
+        COALESCE(SUM(CASE WHEN payment_status = 'paid' 
+                          AND payment_date >= DATE_TRUNC('month', DATE($1 || '-' || LPAD($2::text, 2, '0') || '-01'))
+                          AND payment_date < DATE_TRUNC('month', DATE($1 || '-' || LPAD($2::text, 2, '0') || '-01')) + INTERVAL '1 month'
+                     THEN amount_paid END), 0) as total_collected,
+  
+        COALESCE(SUM(CASE WHEN payment_status IN ('overdue', 'pending') 
+                          AND due_date < CURRENT_DATE 
+                     THEN amount_due END), 0) as outstanding_rent
+      FROM rent_payments
+    ),
+    monthly_expected AS (
+      SELECT 
+        COALESCE(SUM(amount_due), 0) as expected_revenue
+      FROM rent_payments
+      WHERE due_date >= DATE_TRUNC('month', DATE($1 || '-' || LPAD($2::text, 2, '0') || '-01'))
+        AND due_date < DATE_TRUNC('month', DATE($1 || '-' || LPAD($2::text, 2, '0') || '-01')) + INTERVAL '1 month'
+    ),
+    monthly_maintenance AS (
+      SELECT 
+        COALESCE(SUM(CASE WHEN completed_date >= DATE_TRUNC('month', DATE($1 || '-' || LPAD($2::text, 2, '0') || '-01'))
+                          AND completed_date < DATE_TRUNC('month', DATE($1 || '-' || LPAD($2::text, 2, '0') || '-01')) + INTERVAL '1 month'
+                     THEN actual_cost END), 0) as maintenance_costs
+      FROM maintenance_requests
+      WHERE actual_cost IS NOT NULL
+    ),
+    monthly_property_expenses AS (
+      SELECT 
+        COALESCE(SUM(
+          CASE 
+            WHEN frequency = 'monthly' AND is_active = true 
+              AND start_date <= DATE($1 || '-' || LPAD($2::text, 2, '0') || '-01')
+              AND (end_date IS NULL OR end_date >= DATE_TRUNC('month', DATE($1 || '-' || LPAD($2::text, 2, '0') || '-01')))
+            THEN amount
+            
+            WHEN frequency = 'quarterly' AND is_active = true
+              AND start_date <= DATE($1 || '-' || LPAD($2::text, 2, '0') || '-01')
+              AND (end_date IS NULL OR end_date >= DATE_TRUNC('month', DATE($1 || '-' || LPAD($2::text, 2, '0') || '-01')))
+            THEN amount / 3.0
+            
+            WHEN frequency = 'semi-annual' AND is_active = true
+              AND start_date <= DATE($1 || '-' || LPAD($2::text, 2, '0') || '-01')
+              AND (end_date IS NULL OR end_date >= DATE_TRUNC('month', DATE($1 || '-' || LPAD($2::text, 2, '0') || '-01')))
+            THEN amount / 6.0
+            
+            WHEN frequency = 'annual' AND is_active = true
+              AND start_date <= DATE($1 || '-' || LPAD($2::text, 2, '0') || '-01')
+              AND (end_date IS NULL OR end_date >= DATE_TRUNC('month', DATE($1 || '-' || LPAD($2::text, 2, '0') || '-01')))
+            THEN amount / 12.0
+            
+            WHEN frequency = 'one-time'
+              AND expense_date >= DATE_TRUNC('month', DATE($1 || '-' || LPAD($2::text, 2, '0') || '-01'))
+              AND expense_date < (DATE_TRUNC('month', DATE($1 || '-' || LPAD($2::text, 2, '0') || '-01')) + INTERVAL '1 month')
+            THEN amount
+            
+            ELSE 0
+          END
+        ), 0) as property_expenses
+      FROM property_expenses
+      WHERE is_active = true
+    ),
+    final_metrics AS (
+      SELECT 
+        mp.collected_revenue,
+        mp.utilities_collected,
+        mp.total_collected,
+        me.expected_revenue,
+        mp.outstanding_rent,
+        mm.maintenance_costs as maintenance_costs_this_month,
+        mpe.property_expenses as property_expenses_this_month,
         
-        WHEN frequency = 'annual' AND is_active = true
-          AND start_date <= CURRENT_DATE
-          AND (end_date IS NULL OR end_date >= DATE_TRUNC('month', CURRENT_DATE))
-        THEN amount / 12.0
+        CASE 
+          WHEN me.expected_revenue > 0 
+          THEN ROUND((mp.collected_revenue / me.expected_revenue * 100), 2)
+          ELSE 0
+        END as collection_rate_percentage,
         
-        WHEN frequency = 'one-time'
-          AND expense_date >= DATE_TRUNC('month', CURRENT_DATE)
-          AND expense_date < (DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month')
-        THEN amount
-        
-        ELSE 0
-      END
-    ), 0) as property_expenses
-  FROM property_expenses
-  WHERE is_active = true
-),
-final_metrics AS (
-  SELECT 
-    mp.collected_revenue,
-    mp.utilities_collected,
-    mp.total_collected,
-    me.expected_revenue,
-    mp.outstanding_rent,
-    mm.maintenance_costs as maintenance_costs_this_month,
-    mpe.property_expenses as property_expenses_this_month,
-    
-    -- Collection Rate (rent only, excluding utilities)
-    CASE 
-      WHEN me.expected_revenue > 0 
-      THEN ROUND((mp.collected_revenue / me.expected_revenue * 100), 2)
-      ELSE 0
-    END as collection_rate_percentage,
-    
-    -- Total Expenses
-    mm.maintenance_costs + mpe.property_expenses as total_expenses,
-    
-    -- Net Operating Income (Rent - Expenses, excluding utilities)
-    mp.collected_revenue - (mm.maintenance_costs + mpe.property_expenses) as net_income,
-    
-    -- Total Cash Flow (Rent + Utilities - Expenses)
-    (mp.collected_revenue + mp.utilities_collected) - (mm.maintenance_costs + mpe.property_expenses) as total_cash_flow
-  FROM monthly_payments mp
-  CROSS JOIN monthly_expected me
-  CROSS JOIN monthly_maintenance mm
-  CROSS JOIN monthly_property_expenses mpe
-)
-SELECT * FROM final_metrics;
-      `;
-
+        mm.maintenance_costs + mpe.property_expenses as total_expenses,
+        mp.collected_revenue - (mm.maintenance_costs + mpe.property_expenses) as net_income,
+        (mp.collected_revenue + mp.utilities_collected) - (mm.maintenance_costs + mpe.property_expenses) as total_cash_flow
+      FROM monthly_payments mp
+      CROSS JOIN monthly_expected me
+      CROSS JOIN monthly_maintenance mm
+      CROSS JOIN monthly_property_expenses mpe
+    )
+    SELECT * FROM final_metrics;
+  `;
     // Maintenance Query
     const maintenanceQuery = `
         SELECT 
@@ -270,7 +268,10 @@ SELECT * FROM final_metrics;
     }
 
     try {
-      const financialResult = await client.query(financialQuery);
+      const financialResult = await client.query(financialQuery, [
+        targetYear,
+        targetMonth,
+      ]);
       financialData = financialResult.rows[0] || financialData;
       console.log("✅ Financial data fetched");
     } catch (error) {
@@ -416,13 +417,19 @@ SELECT * FROM final_metrics;
             {
               label: "Net Income",
               value: `KES ${(parseFloat(financialData.net_income) || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
-              color: parseFloat(financialData.net_income) >= 0 ? "bg-blue-100" : "bg-red-200",
+              color:
+                parseFloat(financialData.net_income) >= 0
+                  ? "bg-blue-100"
+                  : "bg-red-200",
               sublabel: "Rent - Expenses",
             },
             {
               label: "Total Cash Flow",
               value: `KES ${(parseFloat(financialData.total_cash_flow) || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
-              color: parseFloat(financialData.total_cash_flow) >= 0 ? "bg-teal-100" : "bg-red-200",
+              color:
+                parseFloat(financialData.total_cash_flow) >= 0
+                  ? "bg-teal-100"
+                  : "bg-red-200",
               sublabel: "All revenue - Expenses",
             },
           ],

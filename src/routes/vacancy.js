@@ -13,7 +13,7 @@ const router = express.Router();
  * Get all properties with vacant units
  * Accessible by: All authenticated users
  */
-router.get("/", authenticateTokenSimple, async (req, res) => {
+router.get("/", async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -114,7 +114,7 @@ router.get("/", authenticateTokenSimple, async (req, res) => {
  * Get detailed information about a specific property and its vacant units
  * Accessible by: All authenticated users
  */
-router.get("/:propertyId", authenticateTokenSimple, async (req, res) => {
+router.get("/:propertyId",  async (req, res) => {
   const client = await pool.connect();
   const { propertyId } = req.params;
 
@@ -215,7 +215,7 @@ router.get("/:propertyId", authenticateTokenSimple, async (req, res) => {
  * Submit an inquiry for a property or specific unit
  * Accessible by: All authenticated users
  */
-router.post("/inquire", authenticateTokenSimple, async (req, res) => {
+router.post("/inquire", async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -309,7 +309,7 @@ router.post("/inquire", authenticateTokenSimple, async (req, res) => {
       preferredContactMethod || 'email',
       moveInDate || null,
       'pending',
-      req.user.id
+      req.user?.id || 1
     ]);
 
     await client.query("COMMIT");
@@ -352,7 +352,7 @@ router.post("/inquire", authenticateTokenSimple, async (req, res) => {
  * Search and filter vacant properties
  * Accessible by: All authenticated users
  */
-router.get("/search", authenticateTokenSimple, async (req, res) => {
+router.get("/search", async (req, res) => {
   const client = await pool.connect();
 
   try {

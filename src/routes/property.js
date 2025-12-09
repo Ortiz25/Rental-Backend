@@ -86,6 +86,53 @@ router.get('/photos/:filename', (req, res) => {
   }
 });
 
+// GET users by role (Caretakers + Building Managers)
+router.get("/users", authenticateTokenSimple, async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const roles = (req.query.roles || "").split(",").map(r => r.trim());
+
+    if (!roles.length) {
+      return res.status(400).json({
+        status: 400,
+        message: "No roles provided"
+      });
+    }
+
+    const query = `
+      SELECT
+        u.id,
+        u.first_name,
+        u.last_name,
+        u.email,
+        u.phone,
+        ur.role_name AS role
+      FROM users u
+      JOIN user_roles ur ON ur.id = u.role_id
+      WHERE ur.role_name = ANY($1)
+      ORDER BY u.first_name
+    `;
+
+    const result = await client.query(query, [roles]);
+
+    res.status(200).json({
+      status: 200,
+      message: "Users fetched successfully",
+      data: result.rows
+    });
+
+  } catch (error) {
+    console.error("Users fetch error:", error);
+    res.status(500).json({ status: 500, message: "Failed to fetch users" });
+  } finally {
+    client.release();
+  }
+});
+
+
+
+
 // Get available amenities - MOVED BEFORE parameterized routes
 router.get("/amenities", authenticateTokenSimple, async (req, res) => {
   const client = await pool.connect();
@@ -366,58 +413,91 @@ router.get("/", authenticateTokenSimple, async (req, res) => {
 
     // Main query to get properties with unit statistics and amenities
     const propertiesQuery = `
-      SELECT 
-        p.id,
-        p.property_name,
-        p.address,
-        p.property_type,
-        p.total_units,
-        p.size_sq_ft,
-        p.monthly_rent as base_monthly_rent,
-        p.security_deposit as base_security_deposit,
-        p.description,
-        p.created_at,
-        
-        -- Unit statistics
-        COUNT(u.id) as actual_units,
-        COUNT(CASE WHEN u.occupancy_status = 'occupied' THEN 1 END) as occupied_units,
-        COUNT(CASE WHEN u.occupancy_status = 'vacant' THEN 1 END) as vacant_units,
-        COUNT(CASE WHEN u.occupancy_status = 'maintenance' THEN 1 END) as maintenance_units,
-        
-        -- Occupancy calculations
-        CASE 
-          WHEN COUNT(u.id) > 0 THEN 
-            ROUND((COUNT(CASE WHEN u.occupancy_status = 'occupied' THEN 1 END)::DECIMAL / COUNT(u.id)) * 100, 2)
-          ELSE 0
-        END as occupancy_rate,
-        
-        -- Rent range from units
-        MIN(u.monthly_rent) as min_unit_rent,
-        MAX(u.monthly_rent) as max_unit_rent,
-        AVG(u.monthly_rent) as avg_unit_rent,
-        
-        -- Unit details for multi-unit properties
-        JSON_AGG(
-  JSON_BUILD_OBJECT(
-    'id', u.id,
-    'unit_number', u.unit_number,
-    'bedrooms', u.bedrooms,
-    'bathrooms', u.bathrooms,
-    'size_sq_ft', u.size_sq_ft,
-    'monthly_rent', u.monthly_rent,
-    'occupancy_status', u.occupancy_status
-  ) ORDER BY u.unit_number
-) as units,
-        -- Primary unit info (for single-unit properties or average)
-        COALESCE(AVG(u.bedrooms), 0) as bedrooms,
-        COALESCE(AVG(u.bathrooms), 0) as bathrooms
-        
-      FROM properties p
-      LEFT JOIN units u ON p.id = u.property_id
-      GROUP BY p.id, p.property_name, p.address, p.property_type, p.total_units, 
-               p.size_sq_ft, p.monthly_rent, p.security_deposit, p.description, p.created_at
-      ORDER BY p.created_at DESC
-    `;
+    SELECT 
+      p.id,
+      p.property_name,
+      p.address,
+      p.property_type,
+      p.total_units,
+      p.size_sq_ft,
+      p.monthly_rent as base_monthly_rent,
+      p.security_deposit as base_security_deposit,
+      p.description,
+      p.created_at,
+      
+      -- Unit statistics
+      COUNT(u.id) as actual_units,
+      COUNT(CASE WHEN u.occupancy_status = 'occupied' THEN 1 END) as occupied_units,
+      COUNT(CASE WHEN u.occupancy_status = 'vacant' THEN 1 END) as vacant_units,
+      COUNT(CASE WHEN u.occupancy_status = 'maintenance' THEN 1 END) as maintenance_units,
+      
+      -- Occupancy calculations
+      CASE 
+        WHEN COUNT(u.id) > 0 THEN 
+          ROUND((COUNT(CASE WHEN u.occupancy_status = 'occupied' THEN 1 END)::DECIMAL / COUNT(u.id)) * 100, 2)
+        ELSE 0
+      END as occupancy_rate,
+      
+      -- Rent range from units
+      MIN(u.monthly_rent) as min_unit_rent,
+      MAX(u.monthly_rent) as max_unit_rent,
+      AVG(u.monthly_rent) as avg_unit_rent,
+      
+      -- Unit details for multi-unit properties
+      JSON_AGG(
+        JSON_BUILD_OBJECT(
+          'id', u.id,
+          'unit_number', u.unit_number,
+          'bedrooms', u.bedrooms,
+          'bathrooms', u.bathrooms,
+          'size_sq_ft', u.size_sq_ft,
+          'monthly_rent', u.monthly_rent,
+          'occupancy_status', u.occupancy_status
+        ) ORDER BY u.unit_number
+      ) as units,
+      
+      -- Primary unit info (for single-unit properties or average)
+      COALESCE(AVG(u.bedrooms), 0) as bedrooms,
+      COALESCE(AVG(u.bathrooms), 0) as bathrooms,
+      
+      -- Caretakers
+      (
+        SELECT JSON_AGG(
+          JSON_BUILD_OBJECT(
+            'id', usr.id,
+            'name', usr.first_name || ' ' || usr.last_name,
+            'phone', usr.phone,
+            'email', usr.email,
+            'is_primary', pc.is_primary
+          ) ORDER BY pc.is_primary DESC, usr.first_name
+        )
+        FROM property_caretakers pc
+        JOIN users usr ON pc.user_id = usr.id
+        WHERE pc.property_id = p.id
+      ) as caretakers,
+      
+      -- Managers
+      (
+        SELECT JSON_AGG(
+          JSON_BUILD_OBJECT(
+            'id', usr.id,
+            'name', usr.first_name || ' ' || usr.last_name,
+            'phone', usr.phone,
+            'email', usr.email,
+            'is_primary', pm.is_primary
+          ) ORDER BY pm.is_primary DESC, usr.first_name
+        )
+        FROM property_managers pm
+        JOIN users usr ON pm.user_id = usr.id
+        WHERE pm.property_id = p.id
+      ) as managers
+      
+    FROM properties p
+    LEFT JOIN units u ON p.id = u.property_id
+    GROUP BY p.id, p.property_name, p.address, p.property_type, p.total_units, 
+             p.size_sq_ft, p.monthly_rent, p.security_deposit, p.description, p.created_at
+    ORDER BY p.created_at DESC
+  `;
 
     const propertiesResult = await client.query(propertiesQuery);
 
@@ -477,34 +557,27 @@ router.get("/", authenticateTokenSimple, async (req, res) => {
         bathrooms: parseFloat(property.bathrooms) || 0,
         squareFootage: property.size_sq_ft || 0,
         monthlyRent: parseFloat(property.base_monthly_rent) || 0,
-        minRent:
-          parseFloat(property.min_unit_rent) ||
-          parseFloat(property.base_monthly_rent) ||
-          0,
-        maxRent:
-          parseFloat(property.max_unit_rent) ||
-          parseFloat(property.base_monthly_rent) ||
-          0,
+        minRent: parseFloat(property.min_unit_rent) || parseFloat(property.base_monthly_rent) || 0,
+        maxRent: parseFloat(property.max_unit_rent) || parseFloat(property.base_monthly_rent) || 0,
         securityDeposit: parseFloat(property.base_security_deposit) || 0,
         description: property.description,
-
+        
         // Occupancy information
         occupancyStatus: occupancyStatus,
         occupancyState: occupancyState,
         occupancyRate: parseFloat(property.occupancy_rate) || 0,
-
-        // Unit statistics - FIXED: Ensure these are numbers, not strings
-        totalUnits: parseInt(
-          property.actual_units || property.total_units || 1,
-          10
-        ),
+        
+        // Unit statistics
+        totalUnits: parseInt(property.actual_units || property.total_units || 1, 10),
         occupiedUnits: parseInt(property.occupied_units || 0, 10),
         vacantUnits: parseInt(property.vacant_units || 0, 10),
         maintenanceUnits: parseInt(property.maintenance_units || 0, 10),
-
+        
         // Additional data
         amenities: amenitiesLookup[property.id] || [],
-        units: property.units, // Detailed unit info for multi-unit properties
+        units: property.units,
+        caretakers: property.caretakers || [],  // NEW
+        managers: property.managers || [],      // NEW
         createdAt: property.created_at,
       };
     });
@@ -577,7 +650,7 @@ router.get("/", authenticateTokenSimple, async (req, res) => {
 });
 
 // Get photos for a specific property
-router.get("/:propertyId/photos", authenticateTokenSimple, async (req, res) => {
+router.get("/:propertyId/photos", async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -1287,5 +1360,125 @@ router.put(
     }
   }
 );
+
+// Add caretaker to property
+router.post("/:propertyId/caretakers", authenticateTokenSimple, authorizeRole(["Super Admin", "Admin", "Manager"]), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { propertyId } = req.params;
+    const { userId, isPrimary } = req.body;
+
+    await client.query(
+      "INSERT INTO property_caretakers (property_id, user_id, is_primary) VALUES ($1, $2, $3)",
+      [propertyId, userId, isPrimary]
+    );
+
+    res.status(201).json({ status: 201, message: "Caretaker added successfully" });
+  } catch (error) {
+    console.error("Error adding caretaker:", error);
+    res.status(500).json({ status: 500, message: "Failed to add caretaker" });
+  } finally {
+    client.release();
+  }
+});
+
+// Remove caretaker from property
+router.delete("/:propertyId/caretakers/:caretakerId", authenticateTokenSimple, authorizeRole(["Super Admin", "Admin", "Manager"]), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { propertyId, caretakerId } = req.params;
+
+    await client.query(
+      "DELETE FROM property_caretakers WHERE property_id = $1 AND user_id = $2",
+      [propertyId, caretakerId]
+    );
+
+    res.status(200).json({ status: 200, message: "Caretaker removed successfully" });
+  } catch (error) {
+    console.error("Error removing caretaker:", error);
+    res.status(500).json({ status: 500, message: "Failed to remove caretaker" });
+  } finally {
+    client.release();
+  }
+});
+
+// Toggle caretaker primary status
+router.put("/:propertyId/caretakers/:caretakerId/toggle-primary", authenticateTokenSimple, authorizeRole(["Super Admin", "Admin", "Manager"]), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { propertyId, caretakerId } = req.params;
+
+    await client.query(
+      "UPDATE property_caretakers SET is_primary = NOT is_primary WHERE property_id = $1 AND user_id = $2",
+      [propertyId, caretakerId]
+    );
+
+    res.status(200).json({ status: 200, message: "Primary status toggled" });
+  } catch (error) {
+    console.error("Error toggling primary:", error);
+    res.status(500).json({ status: 500, message: "Failed to toggle primary status" });
+  } finally {
+    client.release();
+  }
+});
+
+// Same three routes for managers
+router.post("/:propertyId/managers", authenticateTokenSimple, authorizeRole(["Super Admin", "Admin"]), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { propertyId } = req.params;
+    const { userId, isPrimary } = req.body;
+
+    await client.query(
+      "INSERT INTO property_managers (property_id, user_id, is_primary) VALUES ($1, $2, $3)",
+      [propertyId, userId, isPrimary]
+    );
+
+    res.status(201).json({ status: 201, message: "Manager added successfully" });
+  } catch (error) {
+    console.error("Error adding manager:", error);
+    res.status(500).json({ status: 500, message: "Failed to add manager" });
+  } finally {
+    client.release();
+  }
+});
+
+router.delete("/:propertyId/managers/:managerId", authenticateTokenSimple, authorizeRole(["Super Admin", "Admin"]), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { propertyId, managerId } = req.params;
+
+    await client.query(
+      "DELETE FROM property_managers WHERE property_id = $1 AND user_id = $2",
+      [propertyId, managerId]
+    );
+
+    res.status(200).json({ status: 200, message: "Manager removed successfully" });
+  } catch (error) {
+    console.error("Error removing manager:", error);
+    res.status(500).json({ status: 500, message: "Failed to remove manager" });
+  } finally {
+    client.release();
+  }
+});
+
+router.put("/:propertyId/managers/:managerId/toggle-primary", authenticateTokenSimple, authorizeRole(["Super Admin", "Admin"]), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { propertyId, managerId } = req.params;
+
+    await client.query(
+      "UPDATE property_managers SET is_primary = NOT is_primary WHERE property_id = $1 AND user_id = $2",
+      [propertyId, managerId]
+    );
+
+    res.status(200).json({ status: 200, message: "Primary status toggled" });
+  } catch (error) {
+    console.error("Error toggling primary:", error);
+    res.status(500).json({ status: 500, message: "Failed to toggle primary status" });
+  } finally {
+    client.release();
+  }
+});
 
 export default router;
