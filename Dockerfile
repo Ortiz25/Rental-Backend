@@ -36,6 +36,7 @@ RUN pnpm install --prod
 
 # Copy built files from development stage
 COPY --from=development /app/dist ./dist
+COPY --from=development /app/package.json ./
 
 # Expose port
 EXPOSE 5000
